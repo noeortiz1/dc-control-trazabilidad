@@ -327,10 +327,18 @@ def logout():
 
 # --- Interfaz de Autenticación Mínima y Limpia ---
 if not st.session_state.logged_in:
+    # Mostrar logotipo en el inicio de sesión si existe
+    col_log1, col_log2, col_log3 = st.columns([1, 1, 1])
+    with col_log2:
+        if os.path.exists("logo.png"):
+            st.image("logo.png", use_container_width=True)
+        else:
+            st.markdown("<h1 style='text-align: center; margin: 0;'>🏗️</h1>", unsafe_allow_html=True)
+            
     st.markdown("""
-    <div style='text-align: center; margin-top: 50px;'>
-        <h1 style='color: #1f2937;'>🏗️ DC Control</h1>
-        <h3 style='color: #4b5563;'>Sistema de Trazabilidad y Gobierno Corporativo</h3>
+    <div style='text-align: center; margin-top: 10px; margin-bottom: 20px;'>
+        <h1 style='color: #1f2937; font-size: 28px; margin: 0;'>DC Control</h1>
+        <h3 style='color: #4b5563; font-size: 16px; margin: 5px 0 0 0;'>Sistema de Trazabilidad y Gobierno Corporativo</h3>
     </div>
     """, unsafe_allow_html=True)
     
