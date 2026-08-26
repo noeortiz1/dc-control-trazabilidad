@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*--
 import os
 import sqlite3
 import pandas as pd
@@ -16,7 +16,7 @@ st.set_page_config(
     page_icon="🏗️"
 )
 
-# Estilo general minimalista y corporativo para DC Control (Sin usar tablas HTML complejas)
+# Estilo general minimalista y corporativo para DC Control (Componentes 100% nativos)
 st.markdown("""
 <style>
     /* Estilo del encabezado principal */
@@ -104,7 +104,15 @@ def init_db(insert_demos=True):
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Tabla de Proyectos
+    # 1. Tabla de Configuración General
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    
+    # 2. Tabla de Proyectos
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS projects (
             id TEXT PRIMARY KEY,
@@ -124,7 +132,7 @@ def init_db(insert_demos=True):
         )
     ''')
     
-    # 2. Tabla de Tareas (Compuertas)
+    # 3. Tabla de Tareas (Compuertas)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +147,7 @@ def init_db(insert_demos=True):
         )
     ''')
     
-    # 3. Tabla de Auditoría (Audit Trail)
+    # 4. Tabla de Auditoría (Audit Trail)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,13 +159,14 @@ def init_db(insert_demos=True):
         )
     ''')
     
-    # 4. Tabla de Usuarios
+    # 5. Tabla de Usuarios (Con columna de email individual)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
             password TEXT,
             full_name TEXT,
-            role TEXT
+            role TEXT,
+            email TEXT
         )
     ''')
     
@@ -182,25 +191,33 @@ def init_db(insert_demos=True):
             cursor.execute("ALTER TABLE tasks ADD COLUMN completed_by TEXT")
         if 'completed_at' not in task_cols:
             cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
+            
+        user_cols = get_columns('users')
+        if 'email' not in user_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
     except Exception as e:
         pass
         
-    # Inicialización de Usuarios (Si no existen)
+    # Inicialización del estatus en system_settings
+    cursor.execute("SELECT COUNT(*) FROM system_settings WHERE key = 'initialized'")
+    is_initialized = cursor.fetchone()[0] > 0
+    
+    # Inicialización de Usuarios (Siempre deben existir para el Login)
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         demo_users = [
-            ("admin", "admin123", "Director General", "Admin/Director"),
-            ("ventas1", "ventas123", "Ing. Carlos (Ventas)", "Ventas"),
-            ("lider_sur", "sur123", "Ing. Sofía (Líder Regional Sur)", "Líder Regional - Sur"),
-            ("lider_norte", "norte123", "Ing. Alejandro (Líder Regional Norte)", "Líder Regional - Norte"),
-            ("costos_jefe", "jefe123", "Lic. Roberto (Director de Costos)", "Analista de Costos Jefe"),
-            ("costos_jr1", "jr1123", "Ing. Manuel (Analista Jr 1)", "Analista de Costos Junior 1"),
-            ("costos_jr2", "jr2123", "Ing. Gabriel (Analista Jr 2)", "Analista de Costos Junior 2")
+            ("admin", "admin123", "Director General", "Admin/Director", "director@dccontrol.com"),
+            ("ventas1", "ventas123", "Ing. Carlos (Ventas)", "Ventas", "ventas@dccontrol.com"),
+            ("lider_sur", "sur123", "Ing. Sofía (Líder Regional Sur)", "Líder Regional - Sur", "lider.sur@dccontrol.com"),
+            ("lider_norte", "norte123", "Ing. Alejandro (Líder Regional Norte)", "Líder Regional - Norte", "lider.norte@dccontrol.com"),
+            ("costos_jefe", "jefe123", "Lic. Roberto (Director de Costos)", "Analista de Costos Jefe", "costos.jefe@dccontrol.com"),
+            ("costos_jr1", "jr1123", "Ing. Manuel (Analista Jr 1)", "Analista de Costos Junior 1", "costos.jr1@dccontrol.com"),
+            ("costos_jr2", "jr2123", "Ing. Gabriel (Analista Jr 2)", "Analista de Costos Junior 2", "costos.jr2@dccontrol.com")
         ]
-        cursor.executemany("INSERT INTO users VALUES (?, ?, ?, ?)", demo_users)
+        cursor.executemany("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?)", demo_users)
         
-    # Inicialización de Proyectos de prueba (Solo si se solicita y no hay registros)
-    if insert_demos:
+    # Cargar proyectos de demostración SOLO en la primera instalación y si insert_demos es True
+    if not is_initialized and insert_demos:
         cursor.execute("SELECT COUNT(*) FROM projects")
         if cursor.fetchone()[0] == 0:
             demo_projects = [
@@ -209,7 +226,7 @@ def init_db(insert_demos=True):
                 ("PRJ-103", "Mantenimiento Preventivo Chiapas", "Cervecería del Sur", 850000.0, "Chiapas", "Sur", "Líder Regional - Sur", "Analista de Costos Junior 2", "Perdido", 5, 15.0, 0, "2026-08-10", "2026-09-01"),
                 ("PRJ-104", "Subestación Baja California", "Energía del Norte", 3200000.0, "Baja California", "Norte", "Líder Regional - Norte", "Analista de Costos Jefe", "En Proceso", 2, 0.0, 1, "2026-08-20", "2026-11-30")
             ]
-            cursor.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", demo_projects)
+            cursor.executemany("INSERT OR REPLACE INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", demo_projects)
             
             demo_tasks = [
                 (None, "PRJ-101", 1, "Registrar ficha técnica y alcance inicial", "Ventas", 1, "Ing. Carlos (Ventas)", "2026-08-02 10:00:00"),
@@ -225,11 +242,14 @@ def init_db(insert_demos=True):
                 (None, "PRJ-102", 4, "Revisión técnica de dossier de obra", "Líder Regional - Sur", 1, "Ing. Sofía (Líder Regional Sur)", "2026-08-18 16:30:00"),
                 (None, "PRJ-102", 5, "Firma de aprobación final y envío", "Admin/Director", 1, "Director General", "2026-08-20 18:00:00"),
             ]
-            cursor.executemany("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)", demo_tasks)
+            cursor.executemany("INSERT OR REPLACE INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?)", demo_tasks)
+            
+        cursor.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES ('initialized', '1')")
         
     conn.commit()
     conn.close()
 
+# Inicialización al vuelo del sistema
 init_db(insert_demos=True)
 
 # ==========================================
@@ -243,6 +263,23 @@ def log_audit(project_id, user_name, role, action):
     ''', (project_id, user_name, role, action, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
+
+def get_email_for_role(role_name):
+    """Consulta el correo electrónico real configurado en la base de datos para un puesto."""
+    try:
+        conn = get_db_connection()
+        row = conn.execute("SELECT email FROM users WHERE role = ? LIMIT 1", (role_name,)).fetchone()
+        conn.close()
+        if row and row['email']:
+            return row['email']
+    except Exception:
+        pass
+    # Respaldo si no hay un usuario registrado con ese rol
+    return EMAIL_MAP.get(role_name, "soporte@dccontrol.com")
+
+def enviar_correo_alerta(destinatario, rol_dest, asunto, proyecto_nombre, tarea_desc):
+    st.toast(f"📧 Correo simulado enviado a: {destinatario} ({rol_dest})", icon="📨")
+    st.info(f"**Correo enviado a {rol_dest} ({destinatario}):** {asunto} - Tarea: *{tarea_desc}* para el proyecto *{proyecto_nombre}*")
 
 # ==========================================
 # INICIO DE SESIÓN Y LOGIN
@@ -507,20 +544,21 @@ if "📋 Tablero de Proyectos" in tab_dict:
                 }
             )
             
-            # Acciones rápidas de cambio de estatus en un panel limpio
+            # Acciones rápidas de cambio de estatus y eliminación en un panel limpio
             st.markdown("---")
-            with st.expander("⚙️ Acciones Rápidas - Modificar Estatus y Avance"):
+            with st.expander("⚙️ Acciones Rápidas - Modificar o Eliminar Obra"):
                 col_sel_p, col_sel_s, col_sel_e = st.columns([2, 1, 1])
                 with col_sel_p:
-                    proj_select = st.selectbox("Seleccionar Proyecto para Actualizar", [f"{p['id']} - {p['name']}" for p in proyectos])
+                    proj_select = st.selectbox("Seleccionar Proyecto para Editar", [f"{p['id']} - {p['name']}" for p in proyectos], key="action_proj_sel")
                     sel_id = proj_select.split(" - ")[0]
                     proj_data = next(p for p in proyectos if p['id'] == sel_id)
                 with col_sel_s:
-                    nuevo_est = st.selectbox("Estatus Comercial", ["En Proceso", "Ganado", "Perdido", "Cancelado"], index=["En Proceso", "Ganado", "Perdido", "Cancelado"].index(proj_data['status']))
+                    nuevo_est = st.selectbox("Estatus Comercial", ["En Proceso", "Ganado", "Perdido", "Cancelado"], index=["En Proceso", "Ganado", "Perdido", "Cancelado"].index(proj_data['status']), key="action_est_sel")
                 with col_sel_e:
-                    nueva_etapa = st.slider("Etapa Actual", 1, 5, int(proj_data['current_stage']))
+                    nueva_etapa = st.slider("Etapa Actual", 1, 5, int(proj_data['current_stage']), key="action_etp_slider")
                 
-                if nuevo_est != proj_data['status'] or nueva_etapa != proj_data['current_stage']:
+                col_btn_save, col_btn_del = st.columns(2)
+                with col_btn_save:
                     if st.button("Guardar Cambios 💾", use_container_width=True):
                         conn = get_db_connection()
                         conn.execute("UPDATE projects SET status = ?, current_stage = ? WHERE id = ?", (nuevo_est, nueva_etapa, sel_id))
@@ -528,6 +566,21 @@ if "📋 Tablero de Proyectos" in tab_dict:
                         conn.close()
                         log_audit(sel_id, st.session_state.full_name, role, f"Actualizó Estatus comercial a '{nuevo_est}' y Etapa a '{nueva_etapa}'")
                         st.success(f"Proyecto {sel_id} actualizado.")
+                        st.rerun()
+                        
+                with col_btn_del:
+                    confirm_del_proj = st.checkbox(f"Confirmar eliminación completa de {sel_id} ⚠️", value=False, key="chk_del_proj")
+                    btn_del_proj = st.button("Eliminar Proyecto Seleccionado 🗑️", type="primary", use_container_width=True, disabled=not confirm_del_proj)
+                    if btn_del_proj:
+                        conn = get_db_connection()
+                        # Borrar tareas de compuertas
+                        conn.execute("DELETE FROM tasks WHERE project_id = ?", (sel_id,))
+                        # Borrar proyecto
+                        conn.execute("DELETE FROM projects WHERE id = ?", (sel_id,))
+                        conn.commit()
+                        conn.close()
+                        log_audit(sel_id, st.session_state.full_name, role, f"Eliminó el proyecto '{proj_data['name']}' y sus compuertas.")
+                        st.success(f"Proyecto {sel_id} eliminado exitosamente del sistema.")
                         st.rerun()
 
 # ==========================================
@@ -592,7 +645,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                 with col_task_info:
                                     st.markdown(f"#### {t['title']}")
                                     st.write(f"👤 **Rol Responsable:** {t['assigned_role']}")
-                                    email_dest = EMAIL_MAP.get(t['assigned_role'], "soporte@dccontrol.com")
+                                    email_dest = get_email_for_role(t['assigned_role'])
                                     st.write(f"📧 **Correo del Responsable:** {email_dest}")
                                 with col_task_status:
                                     if t['is_completed'] == 1:
@@ -601,32 +654,27 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                     else:
                                         st.error("⏳ PENDIENTE")
                                 
-                                # Botones de acción estables
-                                col_act_comp, col_act_mail = st.columns(2)
-                                with col_act_comp:
-                                    puesto_usuario = st.session_state.user_role
-                                    puesto_es_valido = (t['assigned_role'] == puesto_usuario or puesto_usuario == "Admin/Director")
-                                    
-                                    if t['is_completed'] == 0:
-                                        btn_comp = st.button("Validar y Completar Tarea ✔️", key=f"btn_comp_{t['id']}", disabled=not puesto_es_valido, use_container_width=True)
-                                        if btn_comp:
-                                            conn_up = get_db_connection()
-                                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                            conn_up.execute('''
-                                                UPDATE tasks 
-                                                SET is_completed = 1, completed_by = ?, completed_at = ?
-                                                WHERE id = ?
-                                            ''', (st.session_state.full_name, now_str, t['id']))
-                                            conn_up.commit()
-                                            conn_up.close()
-                                            log_audit(p['id'], st.session_state.full_name, role, f"Completó la compuerta técnica Etapa {t['stage']}: '{t['title']}'")
-                                            st.success("¡Tarea completada con éxito!")
-                                            st.rerun()
-                                    else:
-                                        st.caption("Esta tarea ha sido validada.")
+                                # Botón de acción estable
+                                puesto_usuario = st.session_state.user_role
+                                puesto_es_valido = (t['assigned_role'] == puesto_usuario or puesto_usuario == "Admin/Director")
                                 
-                                with col_act_mail:
-                                    st.write("") # Mantenimiento a futuro limpio
+                                if t['is_completed'] == 0:
+                                    btn_comp = st.button("Validar y Completar Tarea ✔️", key=f"btn_comp_{t['id']}", disabled=not puesto_es_valido, use_container_width=True)
+                                    if btn_comp:
+                                        conn_up = get_db_connection()
+                                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        conn_up.execute('''
+                                            UPDATE tasks 
+                                            SET is_completed = 1, completed_by = ?, completed_at = ?
+                                            WHERE id = ?
+                                        ''', (st.session_state.full_name, now_str, t['id']))
+                                        conn_up.commit()
+                                        conn_up.close()
+                                        log_audit(p['id'], st.session_state.full_name, role, f"Completó la compuerta técnica Etapa {t['stage']}: '{t['title']}'")
+                                        st.success("¡Tarea completada con éxito!")
+                                        st.rerun()
+                                else:
+                                    st.caption("Esta tarea ha sido validada.")
 
 # ==========================================
 # MÓDULO 4: KANBAN VISUAL (100% NATIVO)
@@ -683,35 +731,51 @@ if "👥 Usuarios y Seguridad" in tab_dict:
         users_list = conn.execute("SELECT * FROM users").fetchall()
         conn.close()
         
-        st.markdown("##### Directorio Oficial del Proyecto")
+        st.markdown("##### 👥 Directorio Oficial de Colaboradores")
         
-        # Convertir a DataFrame de Pandas y mostrar nativamente (Sin HTML corrupto)
-        df_users = pd.DataFrame([dict(u) for u in users_list])
-        df_users_display = df_users.rename(columns={
-            'username': 'Nombre de Usuario',
-            'full_name': 'Nombre Completo',
-            'role': 'Puesto / Rol'
-        })[['Nombre de Usuario', 'Nombre Completo', 'Puesto / Rol']]
-        
-        st.dataframe(df_users_display, use_container_width=True, hide_index=True)
-        
-        # Registrar nuevo usuario
+        # Presentación en tarjetas visuales de alto nivel (Cero HTML crudo a la vista)
+        for u in users_list:
+            with st.container(border=True):
+                col_u_info, col_u_role, col_u_mail, col_u_action = st.columns([2, 2, 3, 1])
+                with col_u_info:
+                    st.markdown(f"**{u['full_name']}**")
+                    st.caption(f"Usuario: `{u['username']}`")
+                with col_u_role:
+                    st.markdown(f"💼 **Puesto:** {u['role']}")
+                with col_u_mail:
+                    user_email = u['email'] if ('email' in u.keys() and u['email']) else "No configurado"
+                    st.markdown(f"📧 **Correo:** `{user_email}`")
+                with col_u_action:
+                    # Protección del admin maestro o de sí mismo
+                    is_protected = (u['username'] == 'admin' or u['username'] == st.session_state.user_name)
+                    if st.button("🗑️", key=f"del_user_{u['username']}", disabled=is_protected, help="Eliminar Usuario"):
+                        conn_del = get_db_connection()
+                        conn_del.execute("DELETE FROM users WHERE username = ?", (u['username'],))
+                        conn_del.commit()
+                        conn_del.close()
+                        log_audit("SISTEMA", st.session_state.full_name, role, f"Eliminó la cuenta de usuario: '{u['username']}'")
+                        st.success(f"Usuario '{u['username']}' eliminado del sistema.")
+                        st.rerun()
+                        
+        # Registrar nuevo usuario con correo individual
         with st.expander("➕ Registrar Nuevo Usuario"):
             with st.form("Add User"):
                 nu_user = st.text_input("Usuario (Login)")
                 nu_pass = st.text_input("Contraseña", type="password")
                 nu_name = st.text_input("Nombre Completo")
                 nu_role = st.selectbox("Puesto / Rol", list(EMAIL_MAP.keys()))
+                nu_email = st.text_input("Correo Electrónico Individual")
                 
                 btn_nu = st.form_submit_button("Crear Cuenta")
                 if btn_nu:
-                    if not nu_user or not nu_pass or not nu_name:
-                        st.error("Todos los campos son obligatorios.")
+                    if not nu_user or not nu_pass or not nu_name or not nu_email:
+                        st.error("Todos los campos (incluyendo el correo electrónico) son obligatorios.")
                     else:
                         conn = get_db_connection()
                         try:
-                            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?)", (nu_user, nu_pass, nu_name, nu_role))
+                            conn.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?)", (nu_user, nu_pass, nu_name, nu_role, nu_email))
                             conn.commit()
+                            log_audit("SISTEMA", st.session_state.full_name, role, f"Creó nueva cuenta de usuario: '{nu_user}'")
                             st.success(f"Usuario {nu_user} creado con éxito.")
                             st.rerun()
                         except sqlite3.IntegrityError:
@@ -724,23 +788,23 @@ if "👥 Usuarios y Seguridad" in tab_dict:
             st.markdown("---")
             st.markdown("##### ⚙️ Mantenimiento de la Base de Datos")
             with st.expander("🚨 Restablecer Base de Datos a Cero"):
-                st.warning("Esta acción borrará de manera permanente todos los proyectos, tareas de compuertas técnicas y bitácoras de auditoría. Las cuentas de usuario se conservarán intactas.")
+                st.warning("Esta acción borrará de manera permanente todos los proyectos, tareas de compuertas técnicas y bitácoras de auditoría. Las cuentas de usuario y contraseñas se conservarán intactas.")
                 confirm_reset = st.checkbox("Entiendo las consecuencias y confirmo que deseo borrar todos los datos del pipeline.")
                 
                 if st.button("Proceder con el Borrado Completo ⚠️", type="primary", disabled=not confirm_reset):
                     try:
                         conn_res = get_db_connection()
                         cursor_res = conn_res.cursor()
-                        cursor_res.execute("DROP TABLE IF EXISTS projects")
-                        cursor_res.execute("DROP TABLE IF EXISTS tasks")
-                        cursor_res.execute("DROP TABLE IF EXISTS audit_log")
+                        # Limpiar los registros de las tablas operativas
+                        cursor_res.execute("DELETE FROM projects")
+                        cursor_res.execute("DELETE FROM tasks")
+                        cursor_res.execute("DELETE FROM audit_log")
+                        # Forzar la marca 'initialized' a '1' en system_settings para que init_db() sepa que NO debe rellenar los demos
+                        cursor_res.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES ('initialized', '1')")
                         conn_res.commit()
                         conn_res.close()
                         
-                        # Recrear tablas vacías (sin insertar proyectos demo)
-                        init_db(insert_demos=False)
-                        
-                        st.success("¡Base de datos de proyectos y tareas restablecida a cero con éxito!")
+                        st.success("¡Base de datos de proyectos, tareas de compuertas y bitácoras de auditoría restablecida a cero con éxito!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error al restablecer la base de datos: {e}")
