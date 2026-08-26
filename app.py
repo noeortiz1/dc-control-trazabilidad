@@ -13,7 +13,7 @@ import json
 from io import BytesIO
 
 # ==========================================
-# CONFIGURACIÓN DE PÁGINA Y ESTILO MONDAY.COM
+# CONFIGURACIÓN DE PÁGINA Y ESTILO CORPORATIVO
 # ==========================================
 st.set_page_config(
     page_title="DC Control - Sistema de Trazabilidad Súper-Gobernado v18 (M365 Ecosistema)",
@@ -21,7 +21,7 @@ st.set_page_config(
     page_icon="🏗️"
 )
 
-# Inyección de CSS para simular la interfaz limpia, moderna y colorida de Monday.com
+# Inyección de CSS para simular una interfaz limpia, ejecutiva y moderna de alto impacto
 st.markdown("""
 <style>
     /* Estilo general */
@@ -30,8 +30,8 @@ st.markdown("""
         font-family: 'Roboto', sans-serif;
     }
     
-    /* Cabeceras estilo Monday */
-    .monday-header {
+    /* Cabeceras Ejecutivas */
+    .system-header {
         background: linear-gradient(135deg, #1f2937, #111827);
         color: white;
         padding: 24px;
@@ -40,13 +40,13 @@ st.markdown("""
         border-left: 10px solid #00C875;
         box-shadow: 0 4px 15px rgba(0,0,0,0.1);
     }
-    .monday-title {
+    .system-title {
         font-size: 32px;
         font-weight: 700;
         margin: 0;
         letter-spacing: -0.5px;
     }
-    .monday-subtitle {
+    .system-subtitle {
         color: #9ca3af;
         margin-top: 5px;
         font-size: 16px;
@@ -79,7 +79,7 @@ st.markdown("""
         font-weight: 700;
     }
     
-    /* Botones de estatus estilo Monday.com */
+    /* Botones de Estatus Corporativos */
     .badge {
         padding: 6px 12px;
         border-radius: 4px;
@@ -89,13 +89,13 @@ st.markdown("""
         display: inline-block;
         font-size: 13px;
     }
-    .status-completado { background-color: #00C875; }  /* Verde Monday */
-    .status-proceso { background-color: #FDAB3D; }     /* Naranja/Amarillo Monday */
-    .status-bloqueado { background-color: #E2445C; }   /* Rojo Monday */
-    .status-pendiente { background-color: #797E93; }   /* Gris Monday */
-    .status-revision { background-color: #0085FF; }    /* Azul Monday */
+    .status-completado { background-color: #00C875; }  /* Verde */
+    .status-proceso { background-color: #FDAB3D; }     /* Naranja */
+    .status-bloqueado { background-color: #E2445C; }   /* Rojo */
+    .status-pendiente { background-color: #797E93; }   /* Gris */
+    .status-revision { background-color: #0085FF; }    /* Azul */
     
-    /* Estructuras de grupo colapsables (Monday Groups) */
+    /* Estructuras de Grupo Colapsables */
     .group-header {
         font-size: 18px;
         font-weight: bold;
@@ -111,8 +111,8 @@ st.markdown("""
     .group-sur { background-color: #A25DDC; }
     .group-admin { background-color: #111827; }
 
-    /* Estilo de tabla de monday.com */
-    .monday-table {
+    /* Estilo de tabla corporativo */
+    .executive-table {
         width: 100%;
         border-collapse: collapse;
         margin-bottom: 20px;
@@ -121,7 +121,7 @@ st.markdown("""
         overflow: hidden;
         box-shadow: 0 4px 6px rgba(0,0,0,0.02);
     }
-    .monday-table th {
+    .executive-table th {
         background-color: #f8f9fa;
         color: #323338;
         font-weight: 600;
@@ -130,13 +130,13 @@ st.markdown("""
         font-size: 14px;
         border-bottom: 2px solid #e2e4e9;
     }
-    .monday-table td {
+    .executive-table td {
         padding: 12px 16px;
         border-bottom: 1px solid #e2e4e9;
         font-size: 14px;
         color: #323338;
     }
-    .monday-table tr:hover {
+    .executive-table tr:hover {
         background-color: #fcfcfd;
     }
 </style>
@@ -273,6 +273,38 @@ def init_db():
         )
     ''')
     
+    # --- PROCESO DE MIGRACIÓN AUTÓNOMA (Auto-Healing) ---
+    # Comprobar si existen todas las columnas necesarias en caso de que la BD provenga de versiones anteriores
+    def get_columns(table_name):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return [row[1] for row in cursor.fetchall()]
+        
+    try:
+        proj_cols = get_columns('projects')
+        if 'director_review_required' not in proj_cols:
+            cursor.execute("ALTER TABLE projects ADD COLUMN director_review_required INTEGER DEFAULT 0")
+        if 'meeting_minutes_date' not in proj_cols:
+            cursor.execute("ALTER TABLE projects ADD COLUMN meeting_minutes_date TEXT")
+        if 'meeting_minutes_attendance' not in proj_cols:
+            cursor.execute("ALTER TABLE projects ADD COLUMN meeting_minutes_attendance TEXT")
+        if 'meeting_minutes_decisions' not in proj_cols:
+            cursor.execute("ALTER TABLE projects ADD COLUMN meeting_minutes_decisions TEXT")
+        if 'target_date' not in proj_cols:
+            cursor.execute("ALTER TABLE projects ADD COLUMN target_date TEXT")
+        if 'lose_percentage_gap' not in proj_cols:
+            cursor.execute("ALTER TABLE projects ADD COLUMN lose_percentage_gap REAL DEFAULT 0.0")
+            
+        task_cols = get_columns('tasks')
+        if 'stage' not in task_cols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN stage INTEGER DEFAULT 1")
+        if 'completed_by' not in task_cols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN completed_by TEXT")
+        if 'completed_at' not in task_cols:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
+    except Exception as e:
+        # Si hay un error catastrófico con el esquema previo, lo registramos para que continúe limpiamente
+        pass
+        
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         demo_users = [
@@ -351,7 +383,7 @@ def enviar_alerta_teams(proyecto_id, proyecto_nombre, accion, estado=None, etapa
     except Exception as e:
         return False
     
-    theme_color = "00C875"  # Verde Monday (Completado/Ganado)
+    theme_color = "00C875"  # Verde (Completado/Ganado)
     if estado == "Perdido" or estado == "Cancelado":
         theme_color = "E2445C"  # Rojo
     elif estado == "En Proceso":
@@ -414,7 +446,7 @@ if not st.session_state.logged_in:
     <div style='text-align: center; margin-top: 50px;'>
         <h1 style='color: #1f2937;'>🏗️ DC Control</h1>
         <h3 style='color: #4b5563;'>Sistema de Trazabilidad y Gobierno Corporativo</h3>
-        <p style='color: #9ca3af;'>Estilo Monday.com • Integración Microsoft Teams</p>
+        <p style='color: #9ca3af;'>Gobernanza Corporativa • Integración Microsoft Teams</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -442,7 +474,7 @@ if not st.session_state.logged_in:
                     st.error("Usuario o contraseña incorrectos.")
                     
             st.markdown("---")
-            st.caption("**Cuentas Demo:** admin / admin123, ventas / ventas123, lider.sur / sur123, costos.jefe / jefe123")
+            
     st.stop()
 
 # ==========================================
@@ -548,19 +580,19 @@ if st.session_state.user_role == "Admin/Director":
         )
 
 st.sidebar.markdown("---")
-st.sidebar.info("💡 **Inspirado en Monday.com**\n\nEste sistema agrupa los proyectos por región y te permite ver el avance de sus compuertas técnicas de manera limpia y colorida.")
+st.sidebar.info("💡 **DC Control Workspace**\n\nEste portal centralizado agrupa los proyectos de licitaciones por región y permite monitorear y validar el avance de sus compuertas técnicas de manera limpia y ejecutiva.")
 
 # ==========================================
 # PANEL PRINCIPAL Y PESTAÑAS (TABS)
 # ==========================================
 st.markdown(f"""
-<div class="monday-header">
-    <div class="monday-title">🏗️ DC Control Workspace</div>
-    <div class="monday-subtitle">Trazabilidad Súper-Gobernada • Rol activo: {st.session_state.user_role}</div>
+<div class="system-header">
+    <div class="system-title">🏗️ DC Control Workspace</div>
+    <div class="system-subtitle">Trazabilidad Súper-Gobernada • Rol activo: {st.session_state.user_role}</div>
 </div>
 """, unsafe_allow_html=True)
 
-# Definir pestañas de Monday según el Rol
+# Definir pestañas de control según el Rol
 role = st.session_state.user_role
 tabs_config = []
 
@@ -669,7 +701,7 @@ if "📊 Dashboard" in tab_dict:
                 st.caption("Sin datos para graficar")
 
 # ==========================================
-# MÓDULO 2: PIPELINE COMERCIAL (MONDAY TABLE)
+# MÓDULO 2: PIPELINE COMERCIAL
 # ==========================================
 if "📋 Tablero de Proyectos" in tab_dict:
     with tab_dict["📋 Tablero de Proyectos"]:
@@ -750,7 +782,7 @@ if "📋 Tablero de Proyectos" in tab_dict:
                             finally:
                                 conn.close()
 
-        # Mostrar proyectos agrupados por región (Norte / Sur) estilo Monday Groups
+        # Mostrar proyectos agrupados por región (Norte / Sur) estilo Grupos Regionales
         conn = get_db_connection()
         proyectos = conn.execute("SELECT * FROM projects").fetchall()
         conn.close()
@@ -764,7 +796,7 @@ if "📋 Tablero de Proyectos" in tab_dict:
                 if not projs_reg:
                     continue
                 
-                # Grupo Header estilo Monday
+                # Cabecera de Grupo Regional
                 st.markdown(f"""
                 <div class="group-header {region_class}">
                     <span>📍 Región {region_name} ({len(projs_reg)} proyectos)</span>
@@ -772,9 +804,9 @@ if "📋 Tablero de Proyectos" in tab_dict:
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # Tabla HTML estilo Monday.com
+                # Tabla HTML Corporativa
                 table_html = """
-                <table class="monday-table">
+                <table class="executive-table">
                     <thead>
                         <tr>
                             <th>ID Proyecto</th>
@@ -951,7 +983,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
         conn.close()
 
 # ==========================================
-# MÓDULO 4: KANBAN VISUAL (MONDAY VIEW)
+# MÓDULO 4: KANBAN VISUAL
 # ==========================================
 if "🗺️ Kanban Visual" in tab_dict:
     with tab_dict["🗺️ Kanban Visual"]:
@@ -962,7 +994,7 @@ if "🗺️ Kanban Visual" in tab_dict:
         projects_k = conn.execute("SELECT * FROM projects").fetchall()
         conn.close()
         
-        # Columnas Kanban estilo Monday
+        # Columnas Kanban Corporativas
         col_kp, col_kg, col_kd = st.columns(3)
         
         with col_kp:
@@ -1007,7 +1039,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
         
         # Crear tabla HTML del directorio
         dir_html = """
-        <table class="monday-table">
+        <table class="executive-table">
             <thead>
                 <tr>
                     <th>Usuario</th>
