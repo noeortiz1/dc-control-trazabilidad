@@ -481,7 +481,7 @@ if not st.session_state.logged_in:
 # BARRA LATERAL (SIDEBAR)
 # ==========================================
 st.sidebar.markdown(f"### 👤 {st.session_state.full_name}")
-st.sidebar.markdown(f"**Rol:** `{st.session_state.user_role}`")
+st.sidebar.markdown(f"**Rol:** **{st.session_state.user_role}**")
 
 if st.sidebar.button("🚪 Cerrar Sesión", use_container_width=True):
     logout()
@@ -894,93 +894,137 @@ if "📋 Tablero de Proyectos" in tab_dict:
 if "✔️ Compuertas Técnicas" in tab_dict:
     with tab_dict["✔️ Compuertas Técnicas"]:
         st.subheader("✔️ Compuertas Técnicas de Control (Gobernanza)")
-        st.write("Cada etapa del proyecto debe ser aprobada y validada por su rol correspondiente. Las compuertas pendientes generan **alertas activas**.")
+        st.write("Selecciona una obra de la lista para monitorear su progreso etapa por etapa y gestionar sus compuertas técnicas de manera clara y organizada:")
         
         conn = get_db_connection()
         projs = conn.execute("SELECT * FROM projects").fetchall()
-        
-        for p in projs:
-            tasks_p = conn.execute("SELECT * FROM tasks WHERE project_id = ?", (p['id'],)).fetchall()
-            
-            st.markdown(f"""
-            <div style='background-color: #f3f4f6; padding: 10px 15px; border-radius: 6px; margin-top: 15px; border-left: 4px solid #1e3a8a;'>
-                <strong>{p['id']} - {p['name']}</strong> | Cliente: {p['client']} | Región: {p['zone']}
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Dibujar tareas asociadas
-            for t in tasks_p:
-                col_t1, col_t2, col_t3, col_t4 = st.columns([2, 1, 1, 1])
-                
-                with col_t1:
-                    st.write(f"📌 **Etapa {t['stage']}:** {t['title']} (`{t['assigned_role']}`)")
-                
-                with col_t2:
-                    if t['is_completed'] == 1:
-                        st.markdown('<span class="badge status-completado">✔️ COMPLETADA</span>', unsafe_allow_html=True)
-                        st.caption(f"Por: {t['completed_by']} el {t['completed_at']}")
-                    else:
-                        st.markdown('<span class="badge status-bloqueado">⏳ PENDIENTE</span>', unsafe_allow_html=True)
-                        
-                with col_t3:
-                    # Habilitar botón para completarla si el usuario tiene ese rol
-                    puesto_usuario = st.session_state.user_role
-                    puesto_es_valido = (t['assigned_role'] == puesto_usuario or puesto_usuario == "Admin/Director")
-                    
-                    if t['is_completed'] == 0:
-                        btn_comp = st.button("Marcar completada ✔️", key=f"btn_comp_{t['id']}", disabled=not puesto_es_valido)
-                        if btn_comp:
-                            conn_up = get_db_connection()
-                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            conn_up.execute('''
-                                UPDATE tasks 
-                                SET is_completed = 1, completed_by = ?, completed_at = ?
-                                WHERE id = ?
-                            ''', (st.session_state.full_name, now_str, t['id']))
-                            conn_up.commit()
-                            conn_up.close()
-                            log_audit(p['id'], st.session_state.full_name, role, f"Completó la compuerta técnica Etapa {t['stage']}: '{t['title']}'")
-                            
-                            # Alerta de Teams
-                            enviar_alerta_teams(
-                                proyecto_id=p['id'],
-                                proyecto_nombre=p['name'],
-                                accion=f"✔️ COMPUERTA TÉCNICA COMPLETADA: 'Etapa {t['stage']}: {t['title']}'",
-                                estado=p['status'],
-                                etapa=t['stage'],
-                                encargado=st.session_state.full_name
-                            )
-                            
-                            st.success(f"Tarea marcada como completada.")
-                            st.rerun()
-                    else:
-                        st.write("")
-                        
-                with col_t4:
-                    # Enviar recordatorio si está pendiente
-                    if t['is_completed'] == 0:
-                        # Obtener correo destino de los catálogos
-                        email_dest = EMAIL_MAP.get(t['assigned_role'], "soporte@dccontrol.com")
-                        btn_mail = st.button("📧 Enviar Recordatorio", key=f"btn_mail_{t['id']}")
-                        if btn_mail:
-                            enviar_correo_alerta(
-                                destinatario=email_dest,
-                                rol_dest=t['assigned_role'],
-                                asunto=f"Compuerta Técnica Pendiente - {p['id']}",
-                                proyecto_nombre=p['name'],
-                                tarea_desc=t['title']
-                            )
-                            
-                            # Alerta de Teams
-                            enviar_alerta_teams(
-                                proyecto_id=p['id'],
-                                proyecto_nombre=p['name'],
-                                accion=f"⚠️ RECORDATORIO DE TAREA PENDIENTE: 'Etapa {t['stage']}: {t['title']}'",
-                                estado=p['status'],
-                                etapa=t['stage'],
-                                encargado=t['assigned_role']
-                            )
         conn.close()
+        
+        if not projs:
+            st.info("No hay proyectos registrados para administrar compuertas técnicas.")
+        else:
+            proj_options = {f"{p['id']} - {p['name']} ({p['zone']})": p for p in projs}
+            selected_proj_label = st.selectbox("📁 Seleccionar Obra / Proyecto", list(proj_options.keys()))
+            p = proj_options[selected_proj_label]
+            
+            # Tarjetas de metadatos del proyecto
+            col_pm1, col_pm2, col_pm3, col_pm4 = st.columns(4)
+            with col_pm1:
+                st.metric("Cliente", p['client'])
+            with col_pm2:
+                st.metric("Monto Cotizado", f"${p['total_amount']:,.2f}")
+            with col_pm3:
+                st.metric("Estado Comercial", p['status'])
+            with col_pm4:
+                # Progreso visual
+                progress_val = p['current_stage'] / 5.0
+                st.write("**Avance de Compuertas**")
+                st.progress(progress_val)
+                st.caption(f"Etapa actual {p['current_stage']} de 5")
+                
+            st.markdown("---")
+            st.markdown("##### 🏁 Flujo de Trabajo Detallado (Paso a Paso)")
+            
+            # Cargar tareas para este proyecto
+            conn = get_db_connection()
+            tasks_p = conn.execute("SELECT * FROM tasks WHERE project_id = ? ORDER BY stage ASC", (p['id'],)).fetchall()
+            conn.close()
+            
+            # Crear 5 pestañas de Streamlit, una por cada etapa
+            stage_names = [
+                "Etapa 1: Registro 📋",
+                "Etapa 2: Alineación 🤝",
+                "Etapa 3: Ingeniería ⚙️",
+                "Etapa 4: Dossier 📝",
+                "Etapa 5: Cierre 🚀"
+            ]
+            task_tabs = st.tabs(stage_names)
+            
+            # Mapear etapas 1-5 a cada pestaña
+            for stage_idx in range(1, 6):
+                with task_tabs[stage_idx - 1]:
+                    stage_tasks = [t for t in tasks_p if t['stage'] == stage_idx]
+                    
+                    if not stage_tasks:
+                        st.info(f"No hay tareas configuradas para la Etapa {stage_idx}.")
+                    else:
+                        for t in stage_tasks:
+                            with st.container(border=True):
+                                col_task_info, col_task_status = st.columns([3, 1])
+                                with col_task_info:
+                                    st.markdown(f"#### {t['title']}")
+                                    st.write(f"👤 **Rol Responsable:** **{t['assigned_role']}**")
+                                    email_dest = EMAIL_MAP.get(t['assigned_role'], "soporte@dccontrol.com")
+                                    st.write(f"📧 **Correo:** {email_dest}")
+                                with col_task_status:
+                                    if t['is_completed'] == 1:
+                                        st.markdown('<div style="text-align: center;"><span class="badge status-completado" style="display: block; width: 100%; padding: 10px;">✔️ COMPLETADA</span></div>', unsafe_allow_html=True)
+                                        st.caption(f"Por: {t['completed_by']}\nFecha: {t['completed_at']}")
+                                    else:
+                                        st.markdown('<div style="text-align: center;"><span class="badge status-bloqueado" style="display: block; width: 100%; padding: 10px;">⏳ PENDIENTE</span></div>', unsafe_allow_html=True)
+                                
+                                st.markdown("<br>", unsafe_allow_html=True)
+                                # Fila de acciones dentro de la tarjeta
+                                col_act_comp, col_act_alert = st.columns(2)
+                                
+                                with col_act_comp:
+                                    puesto_usuario = st.session_state.user_role
+                                    puesto_es_valido = (t['assigned_role'] == puesto_usuario or puesto_usuario == "Admin/Director")
+                                    
+                                    if t['is_completed'] == 0:
+                                        btn_comp = st.button("Marcar como Completada ✔️", key=f"btn_comp_{t['id']}", disabled=not puesto_es_valido, use_container_width=True)
+                                        if btn_comp:
+                                            conn_up = get_db_connection()
+                                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                            conn_up.execute('''
+                                                UPDATE tasks 
+                                                SET is_completed = 1, completed_by = ?, completed_at = ?
+                                                WHERE id = ?
+                                            ''', (st.session_state.full_name, now_str, t['id']))
+                                            
+                                            # Actualizar etapa del proyecto si es la última completada
+                                            # Para hacerlo dinámico, si completamos tareas de la etapa actual, verificamos
+                                            # si quedan tareas pendientes en esta etapa o anteriores.
+                                            conn_up.commit()
+                                            conn_up.close()
+                                            
+                                            log_audit(p['id'], st.session_state.full_name, role, f"Completó la compuerta técnica Etapa {t['stage']}: {t['title']}")
+                                            
+                                            # Alerta de Teams
+                                            enviar_alerta_teams(
+                                                proyecto_id=p['id'],
+                                                proyecto_nombre=p['name'],
+                                                accion=f"✔️ COMPUERTA TÉCNICA COMPLETADA: Etapa {t['stage']} - {t['title']}",
+                                                estado=p['status'],
+                                                etapa=t['stage'],
+                                                encargado=st.session_state.full_name
+                                            )
+                                            st.success(f"¡Tarea '{t['title']}' marcada como completada con éxito!")
+                                            st.rerun()
+                                    else:
+                                        st.write("✨ *Esta tarea ha sido completada de acuerdo a las directrices de gobierno.*")
+                                        
+                                with col_act_alert:
+                                    if t['is_completed'] == 0:
+                                        btn_mail = st.button("📧 Enviar Recordatorio / Alerta", key=f"btn_mail_{t['id']}", use_container_width=True)
+                                        if btn_mail:
+                                            enviar_correo_alerta(
+                                                destinatario=email_dest,
+                                                rol_dest=t['assigned_role'],
+                                                asunto=f"Compuerta Técnica Pendiente - {p['id']}",
+                                                proyecto_nombre=p['name'],
+                                                tarea_desc=t['title']
+                                            )
+                                            # Alerta de Teams
+                                            enviar_alerta_teams(
+                                                proyecto_id=p['id'],
+                                                proyecto_nombre=p['name'],
+                                                accion=f"⚠️ RECORDATORIO DE TAREA PENDIENTE: Etapa {t['stage']} - {t['title']}",
+                                                estado=p['status'],
+                                                etapa=t['stage'],
+                                                encargado=t['assigned_role']
+                                            )
+                                            st.success("Recordatorio de alerta enviado.")
 
 # ==========================================
 # MÓDULO 4: KANBAN VISUAL
@@ -998,7 +1042,7 @@ if "🗺️ Kanban Visual" in tab_dict:
         col_kp, col_kg, col_kd = st.columns(3)
         
         with col_kp:
-            st.markdown("<div style='background-color:#FDAB3D; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>⏳ EN PROCESO</div>\", unsafe_allow_html=True)", unsafe_allow_html=True)
+            st.markdown("<div style='background-color:#FDAB3D; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>⏳ EN PROCESO</div>", unsafe_allow_html=True)
             for p in projects_k:
                 if p['status'] == "En Proceso":
                     with st.container(border=True):
@@ -1007,7 +1051,7 @@ if "🗺️ Kanban Visual" in tab_dict:
                         st.progress(p['current_stage'] / 5.0)
                         
         with col_kg:
-            st.markdown("<div style='background-color:#00C875; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>✔️ GANADOS</div>\", unsafe_allow_html=True)", unsafe_allow_html=True)
+            st.markdown("<div style='background-color:#00C875; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>✔️ GANADOS</div>", unsafe_allow_html=True)
             for p in projects_k:
                 if p['status'] == "Ganado":
                     with st.container(border=True):
@@ -1016,7 +1060,7 @@ if "🗺️ Kanban Visual" in tab_dict:
                         st.progress(1.0)
                         
         with col_kd:
-            st.markdown("<div style='background-color:#E2445C; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>🚨 PERDIDOS</div>\", unsafe_allow_html=True)", unsafe_allow_html=True)
+            st.markdown("<div style='background-color:#E2445C; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>🚨 PERDIDOS</div>", unsafe_allow_html=True)
             for p in projects_k:
                 if p['status'] == "Perdido":
                     with st.container(border=True):
@@ -1054,7 +1098,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
             email_val = EMAIL_MAP.get(u['role'], "No configurado")
             dir_html += f"""
                 <tr>
-                    <td><code>{u['username']}</code></td>
+                    <td><strong>{u['username']}</strong></td>
                     <td>{u['full_name']}</td>
                     <td><span class="badge" style="background-color: #797E93;">{u['role']}</span></td>
                     <td><a href="mailto:{email_val}">{email_val}</a></td>
@@ -1086,6 +1130,46 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                             st.error("El nombre de usuario ya existe.")
                         finally:
                             conn.close()
+        
+        # --- SECCIÓN DE MANTENIMIENTO: RESTABLECIMIENTO DE BASE DE DATOS (Solo Admin) ---
+        if st.session_state.user_role == "Admin/Director":
+            st.markdown("---")
+            st.markdown("##### ⚙️ Mantenimiento de la Base de Datos")
+            with st.expander("🚨 Restablecer Base de Datos a Cero"):
+                st.warning("Esta acción borrará de manera permanente todos los proyectos, tareas de compuertas técnicas y bitácoras de auditoría. **Las cuentas de usuario y contraseñas se conservarán intactas.**")
+                confirm_reset = st.checkbox("Entiendo las consecuencias de este proceso y confirmo que deseo borrar todos los datos del pipeline de DC Control.")
+                
+                if st.button("Proceder con el Borrado Completo ⚠️", type="primary", disabled=not confirm_reset):
+                    try:
+                        conn_res = get_db_connection()
+                        cursor_res = conn_res.cursor()
+                        cursor_res.execute("DROP TABLE IF EXISTS system_settings")
+                        cursor_res.execute("DROP TABLE IF EXISTS projects")
+                        cursor_res.execute("DROP TABLE IF EXISTS tasks")
+                        cursor_res.execute("DROP TABLE IF EXISTS audit_log")
+                        conn_res.commit()
+                        conn_res.close()
+                        
+                        # Recrear tablas limpias
+                        init_db()
+                        
+                        # Registrar la auditoría de restablecimiento
+                        log_audit("SISTEMA", st.session_state.full_name, st.session_state.user_role, "Restableció toda la base de datos a cero (excepto usuarios).")
+                        
+                        # Alerta de Teams
+                        enviar_alerta_teams(
+                            "SISTEMA",
+                            "Restablecimiento de Base de Datos",
+                            "⚠️ BASE DE DATOS RESTABLECIDA A CERO por la Dirección General. Todos los proyectos y tareas han sido eliminados de manera permanente.",
+                            "Cancelado",
+                            0,
+                            st.session_state.full_name
+                        )
+                        
+                        st.success("¡Base de datos restablecida con éxito! Todos los proyectos, tareas de compuertas y bitácoras de auditoría se han limpiado a cero.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error al restablecer la base de datos: {e}")
 
 # ==========================================
 # MÓDULO 6: BITÁCORA HISTÓRICA (AUDIT TRAIL)
@@ -1093,7 +1177,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
 if "📜 Bitácora Auditoría" in tab_dict:
     with tab_dict["📜 Bitácora Auditoría"]:
         st.subheader("📜 Bitácora Inmutable de Trazabilidad (Audit Trail)")
-        st.write("Registro oficial para el gobierno corporativo de la empresa. Las entradas no se pueden editar ni borrar.")
+        st.write("Registro oficial e inalterable para el gobierno corporativo de la empresa. Los registros contienen sellos de tiempo precisos de auditoría de cada acción comercial u operativa.")
         
         conn = get_db_connection()
         logs = conn.execute("SELECT * FROM audit_log ORDER BY timestamp DESC").fetchall()
@@ -1103,7 +1187,17 @@ if "📜 Bitácora Auditoría" in tab_dict:
             st.info("No se han registrado acciones de trazabilidad aún.")
         else:
             df_logs = pd.DataFrame([dict(l) for l in logs])
-            st.dataframe(df_logs, use_container_width=True)
+            
+            # Renombrar columnas para evitar términos técnicos y de código (leaked jargon)
+            df_logs = df_logs.rename(columns={
+                "id": "Registro ID",
+                "project_id": "Proyecto ID",
+                "user_name": "Usuario Responsable",
+                "role": "Puesto / Rol",
+                "action": "Acción Realizada",
+                "timestamp": "Fecha y Hora"
+            })
+            st.dataframe(df_logs, use_container_width=True, hide_index=True)
 
 # Footer Corporativo
 st.markdown("---")
