@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import textwrap
 import sqlite3
 import pandas as pd
 import plotly.express as px
@@ -201,7 +202,7 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
+def init_db(insert_demos=True):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -319,7 +320,7 @@ def init_db():
         
     # Insertar proyectos demo si no hay datos
     cursor.execute("SELECT COUNT(*) FROM projects")
-    if cursor.fetchone()[0] == 0:
+    if insert_demos and cursor.fetchone()[0] == 0:
         demo_projects = [
             ("PRJ-101", "Ampliación Planta Monterrey", "Aceros de Monterrey S.A.", 1250000.0, "Nuevo León", "Norte", "Líder Regional - Norte", "Analista de Costos Jefe", "En Proceso", 3, 0.0, 1, "2026-08-05", "Marcos Ortiz, Pedro Sánchez", "Se acordó alcance de obra y fecha de cotización técnica.", "2026-08-01", "2026-09-15"),
             ("PRJ-102", "Instalación Eléctrica Querétaro", "Logística del Centro", 450000.0, "Querétaro", "Sur", "Líder Regional - Sur", "Analista de Costos Junior 1", "Ganado", 5, 0.0, 0, "2026-08-06", "Sofía Romero, Pedro Sánchez", "Cliente acepta el catálogo técnico.", "2026-08-05", "2026-10-10"),
@@ -349,7 +350,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+init_db(insert_demos=True)
 
 # ==========================================
 # FUNCIONES AUXILIARES DE GOBIERNO
@@ -442,13 +443,13 @@ def logout():
 
 # --- Interfaz de Autenticación ---
 if not st.session_state.logged_in:
-    st.markdown("""
+    st.markdown(textwrap.dedent("""
     <div style='text-align: center; margin-top: 50px;'>
         <h1 style='color: #1f2937;'>🏗️ DC Control</h1>
         <h3 style='color: #4b5563;'>Sistema de Trazabilidad y Gobierno Corporativo</h3>
         <p style='color: #9ca3af;'>Gobernanza Corporativa • Integración Microsoft Teams</p>
     </div>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
     
     col_l1, col_l2, col_l3 = st.columns([1, 1.5, 1])
     with col_l2:
@@ -632,35 +633,35 @@ if "📊 Dashboard" in tab_dict:
         # Tarjetas KPI elegantes
         col_k1, col_k2, col_k3, col_k4 = st.columns(4)
         with col_k1:
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="kpi-card" style="border-left: 5px solid #00C875;">
                 <div class="kpi-title">Proyectos en Pipeline</div>
                 <div class="kpi-value">{total_p}</div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
         with col_k2:
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="kpi-card" style="border-left: 5px solid #A25DDC;">
                 <div class="kpi-title">Monto Total Cotizado</div>
                 <div class="kpi-value">${monto_total:,.2f}</div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
         with col_k3:
             denom_exito = (ganados_n + perdidos_n)
             tasa_exito = (ganados_n / denom_exito * 100) if denom_exito > 0 else 0.0
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="kpi-card" style="border-left: 5px solid #FDAB3D;">
                 <div class="kpi-title">Efectividad Comercial</div>
                 <div class="kpi-value">{tasa_exito:.1f}%</div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
         with col_k4:
-            st.markdown(f"""
+            st.markdown(textwrap.dedent(f"""
             <div class="kpi-card" style="border-left: 5px solid #E2445C;">
                 <div class="kpi-title">Alertas Activas</div>
                 <div class="kpi-value">{alertas_p}</div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
             
         # Gráficos dinámicos
         st.write("---")
@@ -797,12 +798,12 @@ if "📋 Tablero de Proyectos" in tab_dict:
                     continue
                 
                 # Cabecera de Grupo Regional
-                st.markdown(f"""
+                st.markdown(textwrap.dedent(f"""
                 <div class="group-header {region_class}">
                     <span>📍 Región {region_name} ({len(projs_reg)} proyectos)</span>
                     <span style="font-size: 13px; font-weight: normal;">DC Control de Trazabilidad</span>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
                 
                 # Tabla HTML Corporativa
                 table_html = """
@@ -854,7 +855,7 @@ if "📋 Tablero de Proyectos" in tab_dict:
                         </tr>
                     """
                 table_html += "</tbody></table>"
-                st.markdown(table_html, unsafe_allow_html=True)
+                st.markdown(textwrap.dedent(table_html), unsafe_allow_html=True)
                 
                 # Acciones rápidas del tablero para editar estatus
                 with st.expander(f"⚙️ Acciones Rápidas - Región {region_name}"):
@@ -1105,7 +1106,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                 </tr>
             """
         dir_html += "</tbody></table>"
-        st.markdown(dir_html, unsafe_allow_html=True)
+        st.markdown(textwrap.dedent(dir_html), unsafe_allow_html=True)
         
         # Registrar nuevo usuario
         with st.expander("➕ Registrar Nuevo Usuario"):
@@ -1151,7 +1152,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                         conn_res.close()
                         
                         # Recrear tablas limpias
-                        init_db()
+                        init_db(insert_demos=False)
                         
                         # Registrar la auditoría de restablecimiento
                         log_audit("SISTEMA", st.session_state.full_name, st.session_state.user_role, "Restableció toda la base de datos a cero (excepto usuarios).")
