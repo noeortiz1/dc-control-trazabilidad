@@ -8,12 +8,15 @@ import streamlit as st
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import requests
+import json
+from io import BytesIO
 
 # ==========================================
 # CONFIGURACIÓN DE PÁGINA Y ESTILO MONDAY.COM
 # ==========================================
 st.set_page_config(
-    page_title="DC Control - Sistema de Trazabilidad Súper-Gobernado v18",
+    page_title="DC Control - Sistema de Trazabilidad Súper-Gobernado v18 (M365 Ecosistema)",
     layout="wide",
     page_icon="🏗️"
 )
@@ -202,7 +205,7 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Tabla de Configuración de Correo
+    # 1. Tabla de Configuración General
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS system_settings (
             key TEXT PRIMARY KEY,
@@ -258,9 +261,9 @@ def init_db():
             action TEXT,
             timestamp TEXT
         )
-    ''''')
+    ''')
     
-    # Insertar usuarios demo si no existen
+    # 5. Tabla de Usuarios
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -329,9 +332,65 @@ def log_audit(project_id, user_name, role, action):
     conn.close()
 
 def enviar_correo_alerta(destinatario, rol_dest, asunto, proyecto_nombre, tarea_desc):
-    # En Streamlit local, si no está configurado SMTP real, simulamos el correo
     st.toast(f"📧 Correo simulado enviado a: {destinatario} ({rol_dest})", icon="📨")
     st.info(f"**Correo enviado a {rol_dest} ({destinatario}):** {asunto} - Tarea: *{tarea_desc}* para el proyecto *{proyecto_nombre}*")
+
+# ==========================================
+# INTEGRACIÓN DE MICROSOFT TEAMS (WEBHOOKS)
+# ==========================================
+def enviar_alerta_teams(proyecto_id, proyecto_nombre, accion, estado=None, etapa=None, encargado=None):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM system_settings WHERE key = 'teams_webhook_url'")
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not row['value'].strip():
+            return False
+        webhook_url = row['value'].strip()
+    except Exception as e:
+        return False
+    
+    theme_color = "00C875"  # Verde Monday (Completado/Ganado)
+    if estado == "Perdido" or estado == "Cancelado":
+        theme_color = "E2445C"  # Rojo
+    elif estado == "En Proceso":
+        theme_color = "FDAB3D"  # Naranja
+    elif "RECORDATORIO" in accion:
+        theme_color = "0085FF"  # Azul de recordatorio
+
+    payload = {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": theme_color,
+        "summary": "DC Control - Alerta de Trazabilidad",
+        "sections": [{
+            "activityTitle": "🏗️ **DC Control - Alerta de Gobernanza**",
+            "activitySubtitle": "Actualización de Trazabilidad en tiempo real",
+            "activityImage": "https://img.icons8.com/color/48/000000/microsoft-teams.png",
+            "facts": [
+                {"name": "Proyecto ID", "value": str(proyecto_id)},
+                {"name": "Obra / Proyecto", "value": str(proyecto_nombre)},
+                {"name": "Acción / Alerta", "value": str(accion)},
+                {"name": "Estado Comercial", "value": str(estado or "N/A")},
+                {"name": "Etapa Actual", "value": f"Etapa {etapa}/5" if etapa else "N/A"},
+                {"name": "Encargado / Rol", "value": str(encargado or "N/A")},
+                {"name": "Fecha / Hora", "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            ],
+            "markdown": True
+        }]
+    }
+    
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
+        return response.status_code == 200
+    except Exception as e:
+        return False
 
 # ==========================================
 # INICIO DE SESIÓN Y LOGIN
@@ -349,66 +408,144 @@ def logout():
     st.session_state.full_name = ""
     st.rerun()
 
+# --- Interfaz de Autenticación ---
 if not st.session_state.logged_in:
+    st.markdown("""
+    <div style='text-align: center; margin-top: 50px;'>
+        <h1 style='color: #1f2937;'>🏗️ DC Control</h1>
+        <h3 style='color: #4b5563;'>Sistema de Trazabilidad y Gobierno Corporativo</h3>
+        <p style='color: #9ca3af;'>Estilo Monday.com • Integración Microsoft Teams</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
     col_l1, col_l2, col_l3 = st.columns([1, 1.5, 1])
     with col_l2:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        st.markdown("""
-        <div style='background-color:#1e3a8a; padding:30px; border-radius:15px; text-align:center; margin-bottom:20px; border-left: 8px solid #00C875; box-shadow: 0 4px 10px rgba(0,0,0,0.1);'>
-            <h1 style='color:white; margin:0; font-family:sans-serif; letter-spacing: 2px; font-size: 32px;'>DC CONTROL</h1>
-            <p style='color:#93c5fd; font-family:sans-serif; font-weight: bold; margin: 5px 0 0 0;'>Sistema de Trazabilidad y Gobierno Corporativo v18</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        with st.form("Login Form"):
-            st.markdown("<h4 style='text-align: center; color: #1f2937;'>Ingreso de Colaboradores</h4>", unsafe_allow_html=True)
-            u_name = st.text_input("Usuario")
-            u_pass = st.text_input("Contraseña", type="password")
-            btn_login = st.form_submit_button("Iniciar Sesión 🚪", use_container_width=True)
+        with st.container(border=True):
+            st.write("### 🔐 Acceso al Sistema")
+            username_input = st.text_input("Usuario")
+            password_input = st.text_input("Contraseña", type="password")
+            btn_login = st.button("Ingresar 🚀", use_container_width=True)
             
             if btn_login:
                 conn = get_db_connection()
-                user = conn.execute("SELECT * FROM users WHERE username = ? AND password = ?", (u_name, u_pass)).fetchone()
+                user = conn.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username_input, password_input)).fetchone()
                 conn.close()
+                
                 if user:
                     st.session_state.logged_in = True
                     st.session_state.user_name = user['username']
                     st.session_state.user_role = user['role']
                     st.session_state.full_name = user['full_name']
-                    st.success(f"¡Bienvenido, {user['full_name']}!")
+                    st.success("¡Bienvenido!")
                     st.rerun()
                 else:
-                    st.error("Credenciales incorrectas. Intenta de nuevo.")
-        
-        st.markdown("""
-        <div style='text-align: center; margin-top: 20px; background-color: #f3f4f6; padding: 15px; border-radius: 8px; font-size: 13px; color: #4b5563;'>
-            <strong>Usuarios Demo de Acceso Rápido:</strong><br>
-            • Admin: <code>admin</code> / <code>admin123</code><br>
-            • Ventas: <code>ventas</code> / <code>ventas123</code><br>
-            • Líder Norte: <code>lider.norte</code> / <code>norte123</code>
-        </div>
-        """, unsafe_allow_html=True)
-        st.stop()
+                    st.error("Usuario o contraseña incorrectos.")
+                    
+            st.markdown("---")
+            st.caption("**Cuentas Demo:** admin / admin123, ventas / ventas123, lider.sur / sur123, costos.jefe / jefe123")
+    st.stop()
 
 # ==========================================
-# MENÚ COLABORATIVO (SIDEBAR)
+# BARRA LATERAL (SIDEBAR)
 # ==========================================
-# Cabecera Lateral
-st.sidebar.markdown("""
-<div style='background-color:#1e3a8a; padding:15px; border-radius:10px; text-align:center; margin-bottom:15px; border-left: 5px solid #00C875;'>
-    <h3 style='color:white; margin:0; font-family:sans-serif; letter-spacing: 1px;'>DC CONTROL</h3>
-    <small style='color:#93c5fd;'>Control de Obras & Trazabilidad</small>
-</div>
-""", unsafe_allow_html=True)
-
-st.sidebar.markdown(f"""
-👤 **Sesión Activa:** 
-* **Nombre:** {st.session_state.full_name}
-* **Puesto:** `{st.session_state.user_role}`
-""")
+st.sidebar.markdown(f"### 👤 {st.session_state.full_name}")
+st.sidebar.markdown(f"**Rol:** `{st.session_state.user_role}`")
 
 if st.sidebar.button("🚪 Cerrar Sesión", use_container_width=True):
     logout()
+
+# ==========================================
+# SECCIÓN M365 EN SIDEBAR (Para Administradores)
+# ==========================================
+if st.session_state.user_role == "Admin/Director":
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("🔌 Ecosistema Microsoft 365", expanded=False):
+        st.markdown("**1. Configurar Webhook de Teams**")
+        # Leer valor de la DB
+        conn_set = get_db_connection()
+        cursor_set = conn_set.cursor()
+        cursor_set.execute("SELECT value FROM system_settings WHERE key = 'teams_webhook_url'")
+        row_set = cursor_set.fetchone()
+        current_url = row_set['value'] if row_set else ""
+        conn_set.close()
+        
+        new_url = st.text_input("Webhook URL:", value=current_url, type="password", help="Pega el webhook de Microsoft Teams aquí")
+        
+        if st.button("Guardar Webhook 💾", use_container_width=True):
+            conn_save = get_db_connection()
+            conn_save.execute(
+                "INSERT INTO system_settings (key, value) VALUES ('teams_webhook_url', ?) ON CONFLICT(key) DO UPDATE SET value = ?", 
+                (new_url, new_url)
+            )
+            conn_save.commit()
+            conn_save.close()
+            st.success("¡Webhook guardado con éxito!")
+            st.rerun()
+            
+        if current_url:
+            if st.button("Test Alerta Teams 🚀", use_container_width=True):
+                exito = enviar_alerta_teams(
+                    "PRJ-TEST", 
+                    "Proyecto de Prueba DC Control", 
+                    "Probando conexión desde Streamlit a Microsoft Teams ✅", 
+                    "En Proceso", 
+                    1, 
+                    st.session_state.full_name
+                )
+                if exito:
+                    st.toast("¡Alerta enviada a Teams!", icon="🔔")
+                else:
+                    st.error("Error al enviar. Verifica tu URL de Webhook.")
+                    
+        st.markdown("---")
+        st.markdown("**2. Descargar Respaldo en Excel (M365)**")
+        st.caption("Exporta la base de datos completa a Excel para compartir en SharePoint.")
+        
+        if st.button("Generar Archivo de Excel 📊", use_container_width=True):
+            conn_exp = get_db_connection()
+            df_projs = pd.read_sql_query("SELECT * FROM projects", conn_exp)
+            df_tasks = pd.read_sql_query("SELECT * FROM tasks", conn_exp)
+            df_audit = pd.read_sql_query("SELECT * FROM audit_log ORDER BY timestamp DESC", conn_exp)
+            conn_exp.close()
+            
+            buffer = BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                df_projs.to_excel(writer, sheet_name='Pipeline_Proyectos', index=False)
+                df_tasks.to_excel(writer, sheet_name='Compuertas_Tareas', index=False)
+                df_audit.to_excel(writer, sheet_name='Bitacora_Auditoria', index=False)
+                
+                # Ajustar anchos de columnas automáticamente
+                for sheet_name in writer.sheets:
+                    ws = writer.sheets[sheet_name]
+                    ws.sheet_view.showGridLines = True
+                    for col in ws.columns:
+                        max_len = max(len(str(cell.value or '')) for cell in col)
+                        col_letter = col[0].column_letter
+                        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+                        
+            st.session_state.excel_backup_data = buffer.getvalue()
+            st.success("¡Excel generado!")
+            
+        if 'excel_backup_data' in st.session_state:
+            st.download_button(
+                label="📥 Descargar Excel",
+                data=st.session_state.excel_backup_data,
+                file_name=f"DC_Control_Respaldo_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            
+        st.markdown("---")
+        st.markdown("**3. Integración en Microsoft Teams**")
+        st.caption(
+            "**Como Pestaña Nativa:**\\n\\n"
+            "1. Abre tu canal de Microsoft Teams.\\n"
+            "2. Haz clic en el signo **+** (Agregar pestaña).\\n"
+            "3. Elige **Sitio Web (Website)**.\\n"
+            "4. Pega la URL de tu app en Streamlit Cloud.\\n\\n"
+            "**Persistencia de datos (OneDrive/SharePoint):**\\n\\n"
+            "Si ejecutas el sistema de forma local, coloca el archivo `pipeline_cotizaciones.db` dentro de tu carpeta de OneDrive synced. Se sincronizará automáticamente."
+        )
 
 st.sidebar.markdown("---")
 st.sidebar.info("💡 **Inspirado en Monday.com**\n\nEste sistema agrupa los proyectos por región y te permite ver el avance de sus compuertas técnicas de manera limpia y colorida.")
@@ -444,108 +581,117 @@ tab_dict = {name: tab_obj for name, tab_obj in zip(tabs_config, tabs)}
 # ==========================================
 if "📊 Dashboard" in tab_dict:
     with tab_dict["📊 Dashboard"]:
-        st.subheader("📊 Indicadores de Desempeño y Estado Comercial")
+        st.subheader("📊 Panel de Gobierno Ejecutivo")
         
-        # Cargar datos de la base de datos
+        # Conexión DB y extracción rápida
         conn = get_db_connection()
-        df_proj = pd.read_sql_query("SELECT * FROM projects", conn)
-        df_tasks = pd.read_sql_query("SELECT * FROM tasks", conn)
+        total_p = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+        monto_total = conn.execute("SELECT SUM(total_amount) FROM projects").fetchone()[0] or 0.0
+        ganados_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Ganado'").fetchone()[0]
+        perdidos_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Perdido'").fetchone()[0]
+        projs_all = conn.execute("SELECT * FROM projects").fetchall()
         conn.close()
         
-        # KPIs en tarjetas estilo Monday
-        col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
+        # Conteo de alertas (tareas pendientes)
+        conn = get_db_connection()
+        alertas_p = conn.execute("SELECT COUNT(*) FROM tasks WHERE is_completed = 0").fetchone()[0]
+        conn.close()
         
-        total_p = len(df_proj)
-        total_amount = df_proj['total_amount'].sum()
-        ganados = len(df_proj[df_proj['status'] == 'Ganado'])
-        perdidos = len(df_proj[df_proj['status'] == 'Perdido'])
-        efectividad = (ganados / (ganados + perdidos) * 100) if (ganados + perdidos) > 0 else 0.0
-        tareas_pendientes = len(df_tasks[df_tasks['is_completed'] == 0])
-        
-        with col_kpi1:
-            st.markdown(f"""
-            <div class="kpi-card" style="border-left: 5px solid #579BFC;">
-                <div class="kpi-title">Proyectos Totales</div>
-                <div class="kpi-value">{total_p} Obras</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        with col_kpi2:
+        # Tarjetas KPI elegantes
+        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+        with col_k1:
             st.markdown(f"""
             <div class="kpi-card" style="border-left: 5px solid #00C875;">
-                <div class="kpi-title">Monto Total Cotizado</div>
-                <div class="kpi-value">${total_amount:,.2f}</div>
+                <div class="kpi-title">Proyectos en Pipeline</div>
+                <div class="kpi-value">{total_p}</div>
             </div>
             """, unsafe_allow_html=True)
-            
-        with col_kpi3:
+        with col_k2:
+            st.markdown(f"""
+            <div class="kpi-card" style="border-left: 5px solid #A25DDC;">
+                <div class="kpi-title">Monto Total Cotizado</div>
+                <div class="kpi-value">${monto_total:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_k3:
+            denom_exito = (ganados_n + perdidos_n)
+            tasa_exito = (ganados_n / denom_exito * 100) if denom_exito > 0 else 0.0
             st.markdown(f"""
             <div class="kpi-card" style="border-left: 5px solid #FDAB3D;">
                 <div class="kpi-title">Efectividad Comercial</div>
-                <div class="kpi-value">{efectividad:.1f}% Éxito</div>
+                <div class="kpi-value">{tasa_exito:.1f}%</div>
             </div>
             """, unsafe_allow_html=True)
-            
-        with col_kpi4:
+        with col_k4:
             st.markdown(f"""
             <div class="kpi-card" style="border-left: 5px solid #E2445C;">
-                <div class="kpi-title">Compuertas Técnicas Pendientes</div>
-                <div class="kpi-value">{tareas_pendientes} Alertas</div>
+                <div class="kpi-title">Alertas Activas</div>
+                <div class="kpi-value">{alertas_p}</div>
             </div>
             """, unsafe_allow_html=True)
             
-        # Gráficas dinámicas
+        # Gráficos dinámicos
+        st.write("---")
         col_g1, col_g2 = st.columns(2)
         
+        df_p = pd.DataFrame([dict(p) for p in projs_all]) if projs_all else pd.DataFrame()
+        
         with col_g1:
-            st.markdown("##### Distribución del Monto por Región ($)")
-            df_g_region = df_proj.groupby('zone')['total_amount'].sum().reset_index()
-            fig_region = px.bar(
-                df_g_region, 
-                x='zone', 
-                y='total_amount', 
-                color='zone',
-                color_discrete_map={"Norte": "#579BFC", "Sur": "#A25DDC"},
-                labels={'total_amount': 'Monto ($)', 'zone': 'Región'},
-                text_auto='.2s'
-            )
-            fig_region.update_layout(showlegend=False, height=300, margin=dict(t=10, b=10, l=10, r=10))
-            st.plotly_chart(fig_region, use_container_width=True)
-            
+            st.markdown("##### 📍 Monto Cotizado por Región")
+            if not df_p.empty:
+                fig_reg = px.bar(
+                    df_p, 
+                    x="zone", 
+                    y="total_amount", 
+                    color="zone", 
+                    labels={"total_amount": "Monto ($)", "zone": "Región"},
+                    color_discrete_map={"Norte": "#579BFC", "Sur": "#A25DDC"},
+                    text_auto='.2s'
+                )
+                fig_reg.update_layout(showlegend=False, height=300, margin=dict(t=10, b=10, l=10, r=10))
+                st.plotly_chart(fig_reg, use_container_width=True)
+            else:
+                st.caption("Sin datos para graficar")
+                
         with col_g2:
-            st.markdown("##### Pipeline: Estados Comerciales")
-            df_g_status = df_proj.groupby('status').size().reset_index(name='count')
-            fig_status = px.pie(
-                df_g_status, 
-                values='count', 
-                names='status',
-                color='status',
-                color_discrete_map={"En Proceso": "#FDAB3D", "Ganado": "#00C875", "Perdido": "#E2445C", "Cancelado": "#797E93"},
-                hole=0.4
-            )
-            fig_status.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
-            st.plotly_chart(fig_status, use_container_width=True)
+            st.markdown("##### 📈 Distribución Comercial de Proyectos")
+            if not df_p.empty:
+                fig_stat = px.pie(
+                    df_p, 
+                    names="status", 
+                    color="status",
+                    color_discrete_map={"En Proceso": "#FDAB3D", "Ganado": "#00C875", "Perdido": "#E2445C", "Cancelado": "#797E93"},
+                    hole=0.4
+                )
+                fig_stat.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10))
+                st.plotly_chart(fig_stat, use_container_width=True)
+            else:
+                st.caption("Sin datos para graficar")
 
 # ==========================================
-# MÓDULO 2: TABLERO DE PROYECTOS (MONDAY STYLE)
+# MÓDULO 2: PIPELINE COMERCIAL (MONDAY TABLE)
 # ==========================================
 if "📋 Tablero de Proyectos" in tab_dict:
     with tab_dict["📋 Tablero de Proyectos"]:
-        st.subheader("📋 Tablero de Control de Proyectos")
+        st.subheader("📋 Pipeline de Obras y Proyectos")
         
-        # Botón para añadir nuevo proyecto (Solo Ventas y Admin)
+        # Solo Ventas y Admin pueden crear proyectos
         if role in ["Admin/Director", "Ventas"]:
-            with st.expander("➕ Registrar Nuevo Proyecto / Obra"):
-                with st.form("Agregar Proyecto Form"):
+            with st.expander("➕ Registrar Nuevo Proyecto"):
+                with st.form("Add Project Form"):
                     col_f1, col_f2 = st.columns(2)
                     with col_f1:
-                        p_id = st.text_input("ID del Proyecto (ej. PRJ-105)")
+                        p_id = st.text_input("ID Proyecto (Ej: PRJ-105)")
                         p_name = st.text_input("Nombre de la Obra")
                         p_client = st.text_input("Cliente")
-                        p_amount = st.number_input("Monto Cotizado ($)", min_value=0.0, format="%.2f")
+                        p_amount = st.number_input("Monto Cotizado ($)", min_value=0.0, step=10000.0)
                     with col_f2:
                         p_state = st.selectbox("Estado de la República", list(ESTADOS_MEXICO.keys()))
-                        p_costos = st.selectbox("Analista de Costos Asignado", ["Analista de Costos Jefe", "Analista de Costos Junior 1", "Analista de Costos Junior 2"])
+                        p_costos = st.selectbox("Analista de Costos Asignado", [
+                            "Analista de Costos Jefe", 
+                            "Analista de Costos Junior 1", 
+                            "Analista de Costos Junior 2"
+                        ])
                         p_target = st.date_input("Fecha Compromiso de Entrega")
                     
                     btn_add_proj = st.form_submit_button("Guardar Proyecto en Pipeline 📂")
@@ -584,6 +730,19 @@ if "📋 Tablero de Proyectos" in tab_dict:
                                     
                                 conn.commit()
                                 log_audit(p_id, st.session_state.full_name, role, f"Registró nuevo proyecto: '{p_name}' con monto ${p_amount:,.2f}")
+                                
+                                # Alerta de Teams
+                                teams_sent = enviar_alerta_teams(
+                                    proyecto_id=p_id,
+                                    proyecto_nombre=p_name,
+                                    accion=f"🆕 NUEVO PROYECTO REGISTRADO por un monto de ${p_amount:,.2f}",
+                                    estado="En Proceso",
+                                    etapa=1,
+                                    encargado=p_costos
+                                )
+                                if teams_sent:
+                                    st.toast("🔔 Alerta de nuevo proyecto enviada a Teams", icon="💬")
+                                    
                                 st.success(f"Proyecto {p_id} registrado exitosamente y compuertas de control asignadas.")
                                 st.rerun()
                             except sqlite3.IntegrityError:
@@ -599,64 +758,64 @@ if "📋 Tablero de Proyectos" in tab_dict:
         if not proyectos:
             st.warning("No hay proyectos registrados en este momento.")
         else:
-            for region_name, color_class in [("Norte", "group-norte"), ("Sur", "group-sur")]:
+            for region_name, region_class in [("Norte", "group-norte"), ("Sur", "group-sur")]:
                 projs_reg = [p for p in proyectos if p['zone'] == region_name]
                 
-                # Cabecera de grupo estilo Monday
+                if not projs_reg:
+                    continue
+                
+                # Grupo Header estilo Monday
                 st.markdown(f"""
-                <div class="group-header {color_class}">
-                    <span>📍 Región {region_name}</span>
-                    <span style="font-size: 13px;">{len(projs_reg)} proyectos</span>
+                <div class="group-header {region_class}">
+                    <span>📍 Región {region_name} ({len(projs_reg)} proyectos)</span>
+                    <span style="font-size: 13px; font-weight: normal;">DC Control de Trazabilidad</span>
                 </div>
                 """, unsafe_allow_html=True)
                 
-                if not projs_reg:
-                    st.caption("No hay proyectos en esta región.")
-                    continue
-                
-                # Tabla Monday construida dinámicamente con HTML para lograr el look limpio
+                # Tabla HTML estilo Monday.com
                 table_html = """
                 <table class="monday-table">
                     <thead>
                         <tr>
-                            <th>Código</th>
-                            <th>Nombre de la Obra</th>
+                            <th>ID Proyecto</th>
+                            <th>Obra / Proyecto</th>
                             <th>Cliente</th>
-                            <th>Monto ($)</th>
-                            <th>Estado de Rep.</th>
-                            <th>Líder Regional</th>
-                            <th>Estatus Comercial</th>
+                            <th>Monto Cotizado ($)</th>
+                            <th>Estado de la República</th>
+                            <th>Analista Costos</th>
+                            <th>Estado Comercial</th>
                             <th>Etapa Actual</th>
-                            <th>Revisión Dir.</th>
+                            <th>Rev. Dirección</th>
                         </tr>
                     </thead>
                     <tbody>
                 """
                 
                 for p in projs_reg:
-                    # Formateo de estatus con color de Monday
-                    status_class = "status-pendiente"
-                    if p['status'] == 'Ganado': status_class = "status-completado"
-                    elif p['status'] == 'En Proceso': status_class = "status-proceso"
-                    elif p['status'] == 'Perdido': status_class = "status-bloqueado"
-                    
-                    status_badge = f'<span class="badge {status_class}">{p["status"]}</span>'
-                    
-                    # Formateo de Revisión de Dirección
-                    rev_badge = ""
-                    if p['director_review_required'] == 1:
-                        rev_badge = '<span class="badge status-revision">⚠️ Requerida</span>'
+                    # Estatus comercial badge
+                    if p['status'] == "En Proceso":
+                        status_badge = '<span class="badge status-proceso">En Proceso</span>'
+                    elif p['status'] == "Ganado":
+                        status_badge = '<span class="badge status-completado">Ganado</span>'
+                    elif p['status'] == "Perdido":
+                        status_badge = '<span class="badge status-bloqueado">Perdido</span>'
                     else:
-                        rev_badge = '<span class="badge status-pendiente" style="opacity:0.5;">No req.</span>'
+                        status_badge = '<span class="badge status-pendiente">Cancelado</span>'
+                        
+                    # Revisión dirección badge
+                    if p['director_review_required'] == 1:
+                        rev_badge = '<span class="badge status-revision">REQUERIDA</span>'
+                    else:
+                        rev_badge = '<span class="badge status-pendiente">No requerida</span>'
                         
                     table_html += f"""
                         <tr>
-                            <td><strong>{p['id']}</strong></td>
-                            <td>{p['name']}</td>
+                            <td><code>{p['id']}</code></td>
+                            <td><strong>{p['name']}</strong></td>
                             <td>{p['client']}</td>
                             <td>${p['total_amount']:,.2f}</td>
                             <td>{p['state']}</td>
-                            <td>{p['assigned_lider']}</td>
+                            <td>{p['assigned_costos']}</td>
                             <td>{status_badge}</td>
                             <td><span class="badge" style="background-color: #3f51b5; color: white;">Etapa {p['current_stage']}/5</span></td>
                             <td>{rev_badge}</td>
@@ -672,10 +831,8 @@ if "📋 Tablero de Proyectos" in tab_dict:
                         with col_e1:
                             st.write(f"**{p['id']}** - {p['name']}")
                         with col_e2:
-                            # Cambiar estatus comercial
                             nuevo_est = st.selectbox("Estatus", ["En Proceso", "Ganado", "Perdido", "Cancelado"], index=["En Proceso", "Ganado", "Perdido", "Cancelado"].index(p['status']), key=f"est_sel_{p['id']}")
                         with col_e3:
-                            # Cambiar etapa actual
                             nueva_etapa = st.slider("Etapa Actual", 1, 5, p['current_stage'], key=f"etp_sel_{p['id']}")
                             
                         # Si cambia, actualizar DB
@@ -685,6 +842,17 @@ if "📋 Tablero de Proyectos" in tab_dict:
                             conn.commit()
                             conn.close()
                             log_audit(p['id'], st.session_state.full_name, role, f"Actualizó Estatus comercial a '{nuevo_est}' y Etapa a '{nueva_etapa}'")
+                            
+                            # Alerta de Teams
+                            enviar_alerta_teams(
+                                proyecto_id=p['id'],
+                                proyecto_nombre=p['name'],
+                                accion=f"🔄 Estatus comercial actualizado a '{nuevo_est}' • Etapa actual: {nueva_etapa}/5",
+                                estado=nuevo_est,
+                                etapa=nueva_etapa,
+                                encargado=st.session_state.full_name
+                            )
+                            
                             st.success(f"Cambios guardados para {p['id']}.")
                             st.rerun()
 
@@ -740,6 +908,17 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                             conn_up.commit()
                             conn_up.close()
                             log_audit(p['id'], st.session_state.full_name, role, f"Completó la compuerta técnica Etapa {t['stage']}: '{t['title']}'")
+                            
+                            # Alerta de Teams
+                            enviar_alerta_teams(
+                                proyecto_id=p['id'],
+                                proyecto_nombre=p['name'],
+                                accion=f"✔️ COMPUERTA TÉCNICA COMPLETADA: 'Etapa {t['stage']}: {t['title']}'",
+                                estado=p['status'],
+                                etapa=t['stage'],
+                                encargado=st.session_state.full_name
+                            )
+                            
                             st.success(f"Tarea marcada como completada.")
                             st.rerun()
                     else:
@@ -759,6 +938,16 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                 proyecto_nombre=p['name'],
                                 tarea_desc=t['title']
                             )
+                            
+                            # Alerta de Teams
+                            enviar_alerta_teams(
+                                proyecto_id=p['id'],
+                                proyecto_nombre=p['name'],
+                                accion=f"⚠️ RECORDATORIO DE TAREA PENDIENTE: 'Etapa {t['stage']}: {t['title']}'",
+                                estado=p['status'],
+                                etapa=t['stage'],
+                                encargado=t['assigned_role']
+                            )
         conn.close()
 
 # ==========================================
@@ -777,7 +966,7 @@ if "🗺️ Kanban Visual" in tab_dict:
         col_kp, col_kg, col_kd = st.columns(3)
         
         with col_kp:
-            st.markdown("<div style='background-color:#FDAB3D; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>⏳ EN PROCESO</div>", unsafe_allow_html=True)
+            st.markdown("<div style='background-color:#FDAB3D; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>⏳ EN PROCESO</div>\", unsafe_allow_html=True)", unsafe_allow_html=True)
             for p in projects_k:
                 if p['status'] == "En Proceso":
                     with st.container(border=True):
@@ -786,7 +975,7 @@ if "🗺️ Kanban Visual" in tab_dict:
                         st.progress(p['current_stage'] / 5.0)
                         
         with col_kg:
-            st.markdown("<div style='background-color:#00C875; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>✔️ GANADOS</div>", unsafe_allow_html=True)
+            st.markdown("<div style='background-color:#00C875; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>✔️ GANADOS</div>\", unsafe_allow_html=True)", unsafe_allow_html=True)
             for p in projects_k:
                 if p['status'] == "Ganado":
                     with st.container(border=True):
@@ -795,7 +984,7 @@ if "🗺️ Kanban Visual" in tab_dict:
                         st.progress(1.0)
                         
         with col_kd:
-            st.markdown("<div style='background-color:#E2445C; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>🚨 PERDIDOS</div>", unsafe_allow_html=True)
+            st.markdown("<div style='background-color:#E2445C; color:white; padding:10px; border-radius:5px; text-align:center; font-weight:bold;'>🚨 PERDIDOS</div>\", unsafe_allow_html=True)", unsafe_allow_html=True)
             for p in projects_k:
                 if p['status'] == "Perdido":
                     with st.container(border=True):
@@ -892,5 +1081,3 @@ st.markdown(
     "</p>", 
     unsafe_allow_html=True
 )
-
-
