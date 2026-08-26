@@ -100,6 +100,34 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def generate_next_project_id(state, creation_date=None):
+    if creation_date is None:
+        creation_date = date.today()
+    region = ESTADOS_MEXICO.get(state, "Sur")
+    zone_char = "N" if "Norte" in region else "S"
+    
+    ym_str = creation_date.strftime("%Y%m")
+    prefix = f"DCC-{ym_str}-{zone_char}-"
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM projects WHERE id LIKE ? ORDER BY id DESC LIMIT 1", (prefix + "%",))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        last_id = row['id']
+        try:
+            parts = last_id.split("-")
+            last_consecutive = int(parts[-1])
+            next_consecutive = last_consecutive + 1
+        except (ValueError, IndexError):
+            next_consecutive = 1
+    else:
+        next_consecutive = 1
+        
+    return f"{prefix}{next_consecutive:03d}" 
+
 def init_db(insert_demos=True):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -333,6 +361,13 @@ if not st.session_state.logged_in:
 # ==========================================
 # BARRA LATERAL (SIDEBAR)
 # ==========================================
+# Logotipo de la empresa en la barra lateral (si existe en el repositorio de GitHub)
+if os.path.exists("logo.png"):
+    st.sidebar.image("logo.png", use_container_width=True)
+    st.sidebar.markdown("---")
+else:
+    st.sidebar.markdown("### 🏗️ DC Control")
+
 st.sidebar.markdown(f"### 👤 {st.session_state.full_name}")
 st.sidebar.markdown(f"**Puesto / Rol:** {st.session_state.user_role}")
 
@@ -348,12 +383,20 @@ st.sidebar.info(
 # ==========================================
 # CABECERA PRINCIPAL EN PANTALLA
 # ==========================================
-st.markdown(f"""
-<div class="main-header">
-    <div class="main-title">🏗️ DC Control Workspace</div>
-    <div class="main-subtitle">Control de Trazabilidad y Gobierno de Proyectos • Rol activo: {st.session_state.user_role}</div>
-</div>
-""", unsafe_allow_html=True)
+col_header_logo, col_header_text = st.columns([1, 5])
+with col_header_logo:
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=120)
+    else:
+        st.markdown("<h1 style='margin:0; text-align:center;'>🏗️</h1>", unsafe_allow_html=True)
+
+with col_header_text:
+    st.markdown(f"""
+    <div style='background-color: #111827; color: white; padding: 15px 20px; border-radius: 8px; border-left: 8px solid #00C875;'>
+        <h2 style='margin:0; font-size:24px;'>DC Control Workspace</h2>
+        <p style='margin:5px 0 0 0; color: #9ca3af; font-size:13px;'>Control de Trazabilidad y Gobierno de Proyectos • Rol activo: {st.session_state.user_role}</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Definir pestañas de control según el Rol
 role = st.session_state.user_role
@@ -445,10 +488,11 @@ if "📋 Tablero de Proyectos" in tab_dict:
         # Solo Ventas y Admin pueden crear proyectos
         if role in ["Admin/Director", "Ventas"]:
             with st.expander("➕ Registrar Nuevo Proyecto"):
+                # Forzar rerun si cambia el estado seleccionado para recalcular el ID del proyecto dinámicamente
+                # Para evitar problemas dentro del formulario, mostramos el ID autogenerado que se guardará
                 with st.form("Add Project Form"):
                     col_f1, col_f2 = st.columns(2)
                     with col_f1:
-                        p_id = st.text_input("ID Proyecto (Ej: PRJ-105)")
                         p_name = st.text_input("Nombre de la Obra")
                         p_client = st.text_input("Cliente")
                         p_amount = st.number_input("Monto Cotizado ($)", min_value=0.0, step=10000.0)
@@ -461,11 +505,17 @@ if "📋 Tablero de Proyectos" in tab_dict:
                         ])
                         p_target = st.date_input("Fecha Compromiso de Entrega")
                     
+                    # Generar ID dinámico en tiempo real
+                    p_id = generate_next_project_id(p_state)
+                    st.info(f"📋 **Código de Proyecto Autogenerado:** `{p_id}` (Formato: DCC-AAAAMM-ZONA-CONSECUTIVO)")
+                    
                     btn_add_proj = st.form_submit_button("Guardar Proyecto en Pipeline 📂")
                     
                     if btn_add_proj:
-                        if not p_id or not p_name:
-                            st.error("El ID del Proyecto y Nombre de la Obra son obligatorios.")
+                        # Recalcular ID por seguridad al momento de guardar
+                        p_id = generate_next_project_id(p_state)
+                        if not p_name:
+                            st.error("El Nombre de la Obra es obligatorio.")
                         else:
                             region_auto = ESTADOS_MEXICO[p_state]
                             zone_auto = "Sur" if "Sur" in region_auto else "Norte"
