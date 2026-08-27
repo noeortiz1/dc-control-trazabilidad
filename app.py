@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import json
 import psycopg2
 import psycopg2.extras
 import re
@@ -1829,6 +1830,129 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                                 conn.close()
                                 
             # --- MANTENIMIENTO: RESTABLECIMIENTO TOTAL ---
+                        st.markdown("##### 💾 Copias de Seguridad y Respaldos")
+            with st.expander("💾 Copia de Seguridad y Respaldos"):
+                st.write("Genere un respaldo completo en formato JSON de toda la base de datos (proyectos, usuarios, historial y documentos) para guardarlo de forma segura en su computadora local. Podrá restaurar este archivo en cualquier momento en caso de pérdida o migración.")
+                
+                # Botón de Descarga
+                try:
+                    conn_bk = get_db_connection()
+                    users_bk = [dict(row) for row in conn_bk.execute("SELECT * FROM users").fetchall()]
+                    projects_bk = [dict(row) for row in conn_bk.execute("SELECT * FROM projects").fetchall()]
+                    uploads_bk = [dict(row) for row in conn_bk.execute("SELECT * FROM uploads").fetchall()]
+                    audit_bk = [dict(row) for row in conn_bk.execute("SELECT * FROM audit_log").fetchall()]
+                    conn_bk.close()
+                    
+                    bk_data = {
+                        "backup_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "users": users_bk,
+                        "projects": projects_bk,
+                        "uploads": uploads_bk,
+                        "audit_log": audit_bk
+                    }
+                    
+                    bk_json = json.dumps(bk_data, ensure_ascii=False, indent=2)
+                    st.download_button(
+                        label="📥 Generar y Descargar Respaldo Completo (JSON)",
+                        data=bk_json,
+                        file_name=f"respaldo_dc_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                except Exception as e_bk:
+                    st.error(f"Error al generar respaldo para descarga: {e_bk}")
+                    
+                st.markdown("---")
+                st.markdown("##### 📤 Restaurar Copia de Seguridad")
+                st.write("Suba un archivo de respaldo (.json) generado previamente para restaurar de forma masiva todos los registros (proyectos, usuarios, historial de auditoría y expediente de carga).")
+                st.warning("⚠️ IMPORTANTE: Al realizar la restauración, se limpiará por completo la base de datos actual antes de cargar los datos de respaldo. Esta acción no se puede deshacer.")
+                
+                uploaded_bk_file = st.file_uploader("Seleccione el archivo de respaldo (.json)", type=["json"], key="uploader_backup_rest")
+                if uploaded_bk_file:
+                    confirm_rest = st.checkbox("Confirmo que deseo RESTAURAR la base de datos reemplazando toda la información actual.")
+                    if st.button("Proceder con la Restauración de Datos ⚡", type="primary", disabled=not confirm_rest, use_container_width=True):
+                        try:
+                            bk_content = uploaded_bk_file.read().decode("utf-8")
+                            bk_parsed = json.loads(bk_content)
+                            
+                            required_keys = ["users", "projects", "uploads", "audit_log"]
+                            if not all(k in bk_parsed for k in required_keys):
+                                st.error("❌ El archivo cargado no es un archivo de respaldo válido de DC Control.")
+                            else:
+                                conn_rest = get_db_connection()
+                                cursor_rest = conn_rest.cursor()
+                                
+                                # Limpiar todo
+                                cursor_rest.execute("DROP TABLE IF EXISTS projects CASCADE")
+                                cursor_rest.execute("DROP TABLE IF EXISTS audit_log CASCADE")
+                                cursor_rest.execute("DROP TABLE IF EXISTS uploads CASCADE")
+                                cursor_rest.execute("DROP TABLE IF EXISTS users CASCADE")
+                                conn_rest.commit()
+                                conn_rest.close()
+                                
+                                # Re-inicializar tablas
+                                init_db(insert_demos=False)
+                                
+                                conn_ins = get_db_connection()
+                                cursor_ins = conn_ins.cursor()
+                                
+                                # Insertar usuarios
+                                for u in bk_parsed["users"]:
+                                    cursor_ins.execute("""
+                                        INSERT INTO users (username, password, full_name, role, email)
+                                        VALUES (?, ?, ?, ?, ?)
+                                    """, (u['username'], u['password'], u['full_name'], u['role'], u.get('email', '')))
+                                    
+                                # Insertar proyectos
+                                for p_bk in bk_parsed["projects"]:
+                                    cursor_ins.execute("""
+                                        INSERT INTO projects (
+                                            id, name, client, total_amount, final_amount, state, zone, 
+                                            assigned_lider, assigned_costos, assigned_ventas, status, current_stage, 
+                                            lose_reason, lose_percentage_gap, created_at, target_date, 
+                                            step1_completed, step2_ventas_done, step2_lider_done, step2_completed, 
+                                            step3_completed, step4_completed, step5_completed, step6_completed
+                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        p_bk['id'], p_bk['name'], p_bk['client'], p_bk.get('total_amount', 0.0), p_bk.get('final_amount', 0.0), p_bk['state'], p_bk['zone'],
+                                        p_bk['assigned_lider'], p_bk['assigned_costos'], p_bk['assigned_ventas'], p_bk['status'], p_bk['current_stage'],
+                                        p_bk.get('lose_reason', ''), p_bk.get('lose_percentage_gap', 0.0), p_bk['created_at'], p_bk['target_date'],
+                                        p_bk.get('step1_completed', 0), p_bk.get('step2_ventas_done', 0), p_bk.get('step2_lider_done', 0), p_bk.get('step2_completed', 0),
+                                        p_bk.get('step3_completed', 0), p_bk.get('step4_completed', 0), p_bk.get('step5_completed', 0), p_bk.get('step6_completed', 0)
+                                    ))
+                                    
+                                # Insertar uploads
+                                for up in bk_parsed["uploads"]:
+                                    cursor_ins.execute("""
+                                        INSERT INTO uploads (id, project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    """, (up['id'], up['project_id'], up['step_name'], up['filename'], up['file_path'], up['uploaded_by'], up['uploaded_at']))
+                                    
+                                # Insertar audit_log
+                                for log in bk_parsed["audit_log"]:
+                                    cursor_ins.execute("""
+                                        INSERT INTO audit_log (id, project_id, user_name, role, action, timestamp)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    """, (log['id'], log['project_id'], log['user_name'], log['role'], log['action'], log['timestamp'])
+                                    )
+                                    
+                                # Sincronizar secuencias
+                                try:
+                                    cursor_ins.execute("SELECT setval(pg_get_serial_sequence('uploads', 'id'), coalesce(max(id), 1))")
+                                    cursor_ins.execute("SELECT setval(pg_get_serial_sequence('audit_log', 'id'), coalesce(max(id), 1))")
+                                except Exception:
+                                    pass
+                                    
+                                conn_ins.commit()
+                                conn_ins.close()
+                                
+                                st.success("🎉 ¡Copia de seguridad restaurada de forma exitosa en tu nube!")
+                                log_audit("SISTEMA", st.session_state.full_name, role, "Restauró base de datos desde un archivo de respaldo (.json)")
+                                st.rerun()
+                        except Exception as e_rest:
+                            st.error(f"❌ Error al restaurar respaldo: {e_rest}")
+
+
             st.markdown("##### ⚙️ Mantenimiento de la Base de Datos")
             with st.expander("🚨 Restablecer Base de Datos a Cero"):
                 st.warning("Esta acción borrará de manera definitiva todos los proyectos, archivos cargados en el disco, registros de auditoría y base de datos. Las cuentas de usuario y contraseñas permanecerán seguras.")
