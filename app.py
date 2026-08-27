@@ -3,9 +3,17 @@ import os
 import sqlite3
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import streamlit as st
+import io
+import shutil
 from io import BytesIO
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import shutil
 
 # ==========================================
@@ -300,6 +308,260 @@ def generate_next_project_id(state):
     return f"{prefix}{next_num:03d}"
 
 # ==========================================
+# GENERACIÓN DE DOCUMENTO DOCX (DOSSIER EJECUTIVO)
+# ==========================================
+def generate_docx_report(project_id):
+    conn = get_db_connection()
+    p = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+    uploads = conn.execute("SELECT * FROM uploads WHERE project_id = ? ORDER BY uploaded_at ASC", (project_id,)).fetchall()
+    logs = conn.execute("SELECT * FROM audit_log WHERE project_id = ? ORDER BY timestamp DESC", (project_id,)).fetchall()
+    conn.close()
+
+    if not p:
+        return None
+
+    doc = Document()
+    
+    # Configuración de márgenes
+    for section in doc.sections:
+        section.top_margin = Inches(1.0)
+        section.bottom_margin = Inches(1.0)
+        section.left_margin = Inches(1.0)
+        section.right_margin = Inches(1.0)
+
+    # Estilos globales
+    style_normal = doc.styles['Normal']
+    style_normal.font.name = 'Arial'
+    style_normal.font.size = Pt(11)
+    style_normal.font.color.rgb = RGBColor(51, 51, 51)
+
+    # Encabezado
+    section = doc.sections[0]
+    header = section.header
+    header.is_linked_to_previous = False
+    hp = header.paragraphs[0]
+    hp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    hrun = hp.add_run("DC Control S.A. de C.V. | Reporte Ejecutivo de Trazabilidad")
+    hrun.font.size = Pt(8.5)
+    hrun.font.color.rgb = RGBColor(121, 126, 147)
+
+    # Pie de página con números
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    fp = footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    frun = fp.add_run("DC Control S.A. de C.V. — Control de Cotizaciones  •  Página ")
+    frun.font.size = Pt(9)
+    frun.font.color.rgb = RGBColor(121, 126, 147)
+    
+    fldSimple = OxmlElement('w:fldSimple')
+    fldSimple.set(qn('w:instr'), 'PAGE')
+    fp._p.append(fldSimple)
+
+    # Título Principal
+    title_p = doc.add_paragraph()
+    title_p.paragraph_format.space_before = Pt(12)
+    title_p.paragraph_format.space_after = Pt(6)
+    title_run = title_p.add_run("REPORTE EJECUTIVO DE COTIZACIÓN")
+    title_run.bold = True
+    title_run.font.size = Pt(20)
+    title_run.font.color.rgb = RGBColor(17, 24, 39)
+
+    # Línea de separación verde
+    bar_p = doc.add_paragraph()
+    bar_p.paragraph_format.space_before = Pt(0)
+    bar_p.paragraph_format.space_after = Pt(18)
+    bar_run = bar_p.add_run("―" * 50)
+    bar_run.bold = True
+    bar_run.font.color.rgb = RGBColor(0, 200, 117)
+
+    # Sección 1: Resumen General
+    h1 = doc.add_paragraph()
+    h1_run = h1.add_run("1. Resumen General de la Licitación")
+    h1_run.bold = True
+    h1_run.font.size = Pt(13)
+    h1_run.font.color.rgb = RGBColor(31, 41, 55)
+    h1.paragraph_format.space_after = Pt(10)
+
+    # Tabla de datos generales
+    table = doc.add_table(rows=6, cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+
+    details = [
+        ("Código del Proyecto", str(p['id'])),
+        ("Obra / Proyecto", str(p['name'])),
+        ("Cliente", str(p['client'])),
+        ("Estado de la República", f"{p['state']} ({p['zone']})"),
+        ("Monto Final Cotizado", f"${p['final_amount']:,.2f}"),
+        ("Estatus Comercial", str(p['status']))
+    ]
+
+    for i, (label, val) in enumerate(details):
+        row = table.rows[i]
+        cell_lbl = row.cells[0]
+        cell_lbl.width = Inches(2.2)
+        p_lbl = cell_lbl.paragraphs[0]
+        p_lbl.add_run(label).bold = True
+        
+        cell_val = row.cells[1]
+        cell_val.width = Inches(4.3)
+        p_val = cell_val.paragraphs[0]
+        p_val.add_run(val)
+
+        for cell in (cell_lbl, cell_val):
+            cell.paragraphs[0].paragraph_format.space_after = Pt(4)
+            cell.paragraphs[0].paragraph_format.space_before = Pt(4)
+            if cell == cell_lbl:
+                shd = OxmlElement('w:shd')
+                shd.set(qn('w:fill'), 'F3F4F6')
+                shd.set(qn('w:val'), 'clear')
+                cell._tc.get_or_add_tcPr().append(shd)
+
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+    # Sección 2: Trazabilidad de Pasos
+    h2 = doc.add_paragraph()
+    h2_run = h2.add_run("2. Estado de Pasos y Validación")
+    h2_run.bold = True
+    h2_run.font.size = Pt(13)
+    h2_run.font.color.rgb = RGBColor(31, 41, 55)
+    h2.paragraph_format.space_after = Pt(10)
+
+    steps = [
+        ("Paso 1: Levantamiento Técnico", str(p['assigned_ventas']), p['step1_completed'] == 1),
+        ("Paso 2: Minuta de Trabajo", f"{p['assigned_ventas']} & {p['assigned_lider']}", p['step2_completed'] == 1),
+        ("Paso 3: Catálogo de Conceptos", str(p['assigned_lider']), p['step3_completed'] == 1),
+        ("Paso 4: Elaboración de Cotización", str(p['assigned_costos']), p['step4_completed'] == 1),
+        ("Paso 5: Revisión de Dirección", "Dirección General", p['step5_completed'] == 1),
+        ("Paso 6: Entrega al Cliente", str(p['assigned_ventas']), p['step6_completed'] == 1),
+        ("Paso 7: Cierre Comercial", "Dirección General", p['status'] != 'En Proceso')
+    ]
+
+    for step_title, resp, is_done in steps:
+        sp = doc.add_paragraph(style='List Bullet')
+        sp.paragraph_format.space_after = Pt(4)
+        run_title = sp.add_run(f"{step_title}: ")
+        run_title.bold = True
+        
+        sp.add_run(f"({resp}) ― ")
+        
+        status_text = "✔️ COMPLETADO" if is_done else "⏳ PENDIENTE"
+        status_run = sp.add_run(status_text)
+        status_run.bold = True
+        if is_done:
+            status_run.font.color.rgb = RGBColor(0, 200, 117)
+        else:
+            status_run.font.color.rgb = RGBColor(226, 68, 92)
+
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+    # Sección 3: Dossier de Archivos
+    h3 = doc.add_paragraph()
+    h3_run = h3.add_run("3. Expediente Digital de Archivos")
+    h3_run.bold = True
+    h3_run.font.size = Pt(13)
+    h3_run.font.color.rgb = RGBColor(31, 41, 55)
+    h3.paragraph_format.space_after = Pt(10)
+
+    if not uploads:
+        doc.add_paragraph("No se han cargado documentos para esta cotización aún.")
+    else:
+        table_u = doc.add_table(rows=len(uploads) + 1, cols=4)
+        table_u.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table_u.autofit = False
+
+        headers_u = ["Paso / Etapa", "Nombre del Archivo", "Cargado Por", "Fecha de Carga"]
+        widths_u = [Inches(1.8), Inches(2.2), Inches(1.3), Inches(1.2)]
+
+        hdr_row = table_u.rows[0]
+        for col_idx, text in enumerate(headers_u):
+            cell = hdr_row.cells[col_idx]
+            cell.width = widths_u[col_idx]
+            p_hdr = cell.paragraphs[0]
+            p_hdr.paragraph_format.space_before = Pt(4)
+            p_hdr.paragraph_format.space_after = Pt(4)
+            p_hdr.add_run(text).bold = True
+            shd = OxmlElement('w:shd')
+            shd.set(qn('w:fill'), '111827')
+            shd.set(qn('w:val'), 'clear')
+            cell._tc.get_or_add_tcPr().append(shd)
+            p_hdr.runs[0].font.color.rgb = RGBColor(255, 255, 255)
+
+        for row_idx, f_data in enumerate(uploads):
+            row = table_u.rows[row_idx + 1]
+            step_friendly = f_data['step_name'].replace("step1_", "Paso 1: ").replace("step2_", "Paso 2: ").replace("step3_", "Paso 3: ").replace("step4_", "Paso 4: ").replace("step6_", "Paso 6: ")
+            row_data = [
+                step_friendly.capitalize(),
+                f_data['filename'],
+                f_data['uploaded_by'],
+                f_data['uploaded_at']
+            ]
+            for col_idx, text in enumerate(row_data):
+                cell = row.cells[col_idx]
+                cell.width = widths_u[col_idx]
+                p_cell = cell.paragraphs[0]
+                p_cell.paragraph_format.space_before = Pt(4)
+                p_cell.paragraph_format.space_after = Pt(4)
+                p_cell.add_run(str(text))
+
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+    # Sección 4: Historial de Auditoría
+    h4 = doc.add_paragraph()
+    h4_run = h4.add_run("4. Historial de Cambios (Audit Trail)")
+    h4_run.bold = True
+    h4_run.font.size = Pt(13)
+    h4_run.font.color.rgb = RGBColor(31, 41, 55)
+    h4.paragraph_format.space_after = Pt(10)
+
+    if not logs:
+        doc.add_paragraph("No se cuenta con registros de auditoría para esta licitación.")
+    else:
+        table_l = doc.add_table(rows=len(logs) + 1, cols=4)
+        table_l.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table_l.autofit = False
+
+        headers_l = ["Fecha y Hora", "Colaborador", "Puesto / Rol", "Acción Realizada"]
+        widths_l = [Inches(1.2), Inches(1.3), Inches(1.3), Inches(2.7)]
+
+        hdr_row = table_l.rows[0]
+        for col_idx, text in enumerate(headers_l):
+            cell = hdr_row.cells[col_idx]
+            cell.width = widths_l[col_idx]
+            p_hdr = cell.paragraphs[0]
+            p_hdr.paragraph_format.space_before = Pt(4)
+            p_hdr.paragraph_format.space_after = Pt(4)
+            p_hdr.add_run(text).bold = True
+            shd = OxmlElement('w:shd')
+            shd.set(qn('w:fill'), '111827')
+            shd.set(qn('w:val'), 'clear')
+            cell._tc.get_or_add_tcPr().append(shd)
+            p_hdr.runs[0].font.color.rgb = RGBColor(255, 255, 255)
+
+        for row_idx, log in enumerate(logs):
+            row = table_l.rows[row_idx + 1]
+            row_data = [
+                log['timestamp'],
+                log['user_name'],
+                log['role'],
+                log['action']
+            ]
+            for col_idx, text in enumerate(row_data):
+                cell = row.cells[col_idx]
+                cell.width = widths_l[col_idx]
+                p_cell = cell.paragraphs[0]
+                p_cell.paragraph_format.space_before = Pt(4)
+                p_cell.paragraph_format.space_after = Pt(4)
+                p_cell.add_run(str(text))
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+# ==========================================
 # INICIO DE SESIÓN
 # ==========================================
 if 'logged_in' not in st.session_state:
@@ -405,24 +667,26 @@ tabs = st.tabs(tabs_config)
 tab_dict = {name: tab_obj for name, tab_obj in zip(tabs_config, tabs)}
 
 # ==========================================
-# MÓDULO 1: DASHBOARD
+# MÓDULO 1: DASHBOARD EJECUTIVO
 # ==========================================
 if "📊 Dashboard" in tab_dict:
     with tab_dict["📊 Dashboard"]:
-        st.subheader("📊 Resumen General")
+        st.subheader("📊 Panel de Control de Cotizaciones")
         
+        # Conexión DB y extracción rápida
         conn = get_db_connection()
         total_p = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
-        monto_total = conn.execute("SELECT SUM(total_amount) FROM projects").fetchone()[0] or 0.0
+        monto_total = conn.execute("SELECT SUM(final_amount) FROM projects").fetchone()[0] or 0.0
         ganados_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Ganado'").fetchone()[0]
         perdidos_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Perdido'").fetchone()[0]
         projs_all = conn.execute("SELECT * FROM projects").fetchall()
         alertas_p = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'En Proceso'").fetchone()[0]
         conn.close()
         
+        # Tarjetas KPI elegantes nativas
         col_k1, col_k2, col_k3, col_k4 = st.columns(4)
         with col_k1:
-            st.metric("Licitaciones Totales", total_p)
+            st.metric("Licitaciones Registradas", total_p)
         with col_k2:
             st.metric("Monto Total Cotizado", f"${monto_total:,.2f}")
         with col_k3:
@@ -433,40 +697,183 @@ if "📊 Dashboard" in tab_dict:
             st.metric("Cotizaciones en Curso", alertas_p)
             
         st.markdown("---")
-        col_g1, col_g2 = st.columns(2)
+        
         df_p = pd.DataFrame([dict(p) for p in projs_all]) if projs_all else pd.DataFrame()
         
-        with col_g1:
-            st.markdown("##### 📍 Monto por Región")
-            if not df_p.empty:
+        if df_p.empty:
+            st.info("No hay datos de cotizaciones registrados de momento. Comience a registrar proyectos para ver el panel de gráficas.")
+        else:
+            # Row 1 of Charts
+            col_g1, col_g2 = st.columns(2)
+            
+            with col_g1:
+                st.markdown("##### 📍 Monto Cotizado por Región")
                 fig_reg = px.bar(
                     df_p, 
                     x="zone", 
-                    y="total_amount", 
+                    y="final_amount", 
                     color="zone", 
-                    labels={"total_amount": "Monto ($)", "zone": "Región"},
+                    labels={"final_amount": "Monto Final ($)", "zone": "Región"},
                     color_discrete_map={"Norte": "#3b82f6", "Sur": "#8b5cf6"},
                     text_auto='.2s'
                 )
                 fig_reg.update_layout(showlegend=False, height=280, margin=dict(t=10, b=10, l=10, r=10))
                 st.plotly_chart(fig_reg, use_container_width=True)
-            else:
-                st.caption("Sin datos comerciales que mostrar")
                 
-        with col_g2:
-            st.markdown("##### 📈 Estatus de Licitaciones")
-            if not df_p.empty:
+            with col_g2:
+                st.markdown("##### 📈 Distribución Comercial de Cotizaciones")
+                df_p['Estatus Vista'] = df_p['status'].map({
+                    'En Proceso': 'En Proceso / Recibidas',
+                    'Ganado': 'Ganadas',
+                    'Perdido': 'Perdidas',
+                    'Cancelado': 'Canceladas / Declinadas'
+                }).fillna(df_p['status'])
+                
                 fig_stat = px.pie(
                     df_p, 
-                    names="status", 
-                    color="status",
-                    color_discrete_map={"En Proceso": "#f59e0b", "Ganado": "#10b981", "Perdido": "#ef4444", "Cancelado": "#6b7280"},
+                    names="Estatus Vista", 
+                    color="Estatus Vista",
+                    color_discrete_map={
+                        "En Proceso / Recibidas": "#f59e0b", 
+                        "Ganadas": "#10b981", 
+                        "Perdidas": "#ef4444", 
+                        "Canceladas / Declinadas": "#6b7280"
+                    },
                     hole=0.4
                 )
                 fig_stat.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10))
                 st.plotly_chart(fig_stat, use_container_width=True)
-            else:
-                st.caption("Sin datos comerciales que mostrar")
+            
+            # Row 2 of Charts
+            st.markdown("---")
+            col_g3, col_g4 = st.columns(2)
+            
+            with col_g3:
+                st.markdown("##### 🏆 Zonas de Mayor Éxito (Licitaciones Ganadas por Estado)")
+                df_won = df_p[df_p['status'] == 'Ganado']
+                if df_won.empty:
+                    st.caption("No se han registrado cotizaciones 'Ganadas' para graficar el éxito por zona.")
+                else:
+                    df_won_by_state = df_won.groupby('state').size().reset_index(name='Ganadas')
+                    fig_success_zones = px.bar(
+                        df_won_by_state,
+                        x="state",
+                        y="Ganadas",
+                        labels={"state": "Estado", "Ganadas": "Licitaciones"},
+                        color_discrete_sequence=["#10b981"],
+                        text_auto=True
+                    )
+                    fig_success_zones.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10))
+                    st.plotly_chart(fig_success_zones, use_container_width=True)
+                    
+            with col_g4:
+                st.markdown("##### ⚙️ Análisis de Cuello de Botella (Cotizaciones Activas por Paso)")
+                df_active = df_p[df_p['status'] == 'En Proceso']
+                if df_active.empty:
+                    st.caption("No hay cotizaciones activas 'En Proceso' en este momento.")
+                else:
+                    # Map step names
+                    steps_short = {
+                        1: "1. Levantamiento",
+                        2: "2. Minuta",
+                        3: "3. Catálogo",
+                        4: "4. Cotización",
+                        5: "5. Revisión",
+                        6: "6. Entrega",
+                        7: "7. Cierre"
+                    }
+                    df_active['Etapa Nombre'] = df_active['current_stage'].map(steps_short)
+                    df_bottleneck = df_active.groupby(['current_stage', 'Etapa Nombre']).size().reset_index(name='Cantidad')
+                    df_bottleneck = df_bottleneck.sort_values(by='current_stage')
+                    
+                    fig_bottleneck = px.bar(
+                        df_bottleneck,
+                        x="Etapa Nombre",
+                        y="Cantidad",
+                        labels={"Etapa Nombre": "Paso del Proceso", "Cantidad": "Proyectos Atorados"},
+                        color="Cantidad",
+                        color_continuous_scale="OrRd",
+                        text_auto=True
+                    )
+                    fig_bottleneck.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10), showlegend=False, coloraxis_showscale=False)
+                    st.plotly_chart(fig_bottleneck, use_container_width=True)
+            
+            # Row 3: Gap/Desfase and Delivery Warnings
+            st.markdown("---")
+            col_g5, col_g6 = st.columns(2)
+            
+            with col_g5:
+                st.markdown("##### 📉 Porcentaje de Desfase por Proyecto")
+                df_lost = df_p[(df_p['status'] == 'Perdido') & (df_p['lose_percentage_gap'] > 0)]
+                if df_lost.empty:
+                    st.caption("No hay cotizaciones 'Perdidas' con porcentaje de desfase registrado.")
+                else:
+                    fig_gap = px.bar(
+                        df_lost,
+                        x="id",
+                        y="lose_percentage_gap",
+                        color="zone",
+                        labels={"lose_percentage_gap": "Desfase (%)", "id": "Proyecto ID"},
+                        color_discrete_map={"Norte": "#3b82f6", "Sur": "#8b5cf6"},
+                        text_auto=True
+                    )
+                    fig_gap.update_layout(height=280, margin=dict(t=10, b=10, l=10, r=10))
+                    st.plotly_chart(fig_gap, use_container_width=True)
+                    
+            with col_g6:
+                st.markdown("##### 🔔 Alertas de Fecha de Entrega Próxima (Semáforo)")
+                df_active_warnings = df_p[df_p['status'] == 'En Proceso'].copy()
+                if df_active_warnings.empty:
+                    st.caption("No hay cotizaciones activas en proceso de entrega.")
+                else:
+                    warnings_list = []
+                    for idx, row_warn in df_active_warnings.iterrows():
+                        try:
+                            tgt_dt = datetime.strptime(row_warn['target_date'], "%Y-%m-%d").date()
+                        except:
+                            continue
+                            
+                        days_left = (tgt_dt - date.today()).days
+                        
+                        # Map current stage to friendly name and responsible
+                        stg = row_warn['current_stage']
+                        if stg == 1:
+                            stg_name, resp_name = "Paso 1: Levantamiento", row_warn['assigned_ventas']
+                        elif stg == 2:
+                            stg_name, resp_name = "Paso 2: Minuta de Trabajo", f"{row_warn['assigned_ventas']} / {row_warn['assigned_lider']}"
+                        elif stg == 3:
+                            stg_name, resp_name = "Paso 3: Catálogo de Conceptos", row_warn['assigned_lider']
+                        elif stg == 4:
+                            stg_name, resp_name = "Paso 4: Elaboración de Cotización", row_warn['assigned_costos']
+                        elif stg == 5:
+                            stg_name, resp_name = "Paso 5: Revisión de Dirección", "Noe Ortiz"
+                        elif stg == 6:
+                            stg_name, resp_name = "Paso 6: Entrega al Cliente", row_warn['assigned_ventas']
+                        else:
+                            stg_name, resp_name = "Paso 7: Cierre Comercial", "Noe Ortiz"
+                            
+                        warnings_list.append({
+                            "id": row_warn['id'],
+                            "name": row_warn['name'],
+                            "days_left": days_left,
+                            "stage_name": stg_name,
+                            "responsible": resp_name
+                        })
+                    
+                    if not warnings_list:
+                        st.caption("No hay alertas disponibles.")
+                    else:
+                        # Sort by days_left ascending (most urgent first)
+                        warnings_list = sorted(warnings_list, key=lambda x: x['days_left'])
+                        
+                        for w in warnings_list[:5]: # Show top 5 urgent
+                            if w['days_left'] < 0:
+                                st.error(f"🔴 **{w['id']} - {w['name']}** (VENCIDO HACE {abs(w['days_left'])} DÍAS)  \nAtorado en: *{w['stage_name']}* | Responsable: `{w['responsible']}`")
+                            elif w['days_left'] <= 7:
+                                st.warning(f"🟠 **{w['id']} - {w['name']}** (URGENTE, VENCE EN {w['days_left']} DÍAS)  \nAtorado en: *{w['stage_name']}* | Responsable: `{w['responsible']}`")
+                            else:
+                                st.success(f"🟢 **{w['id']} - {w['name']}** (En tiempo, quedan {w['days_left']} días)  \nUbicación: *{w['stage_name']}* | Responsable: `{w['responsible']}`")
+
 
 # ==========================================
 # MÓDULO 2: TABLERO DE PROYECTOS
@@ -483,7 +890,6 @@ if "📋 Tablero de Proyectos" in tab_dict:
                     with st.form("Add Project Form"):
                         p_name = st.text_input("Nombre de la Obra")
                         p_client = st.text_input("Cliente")
-                        p_amount = st.number_input("Monto Estimado Inicial ($)", min_value=0.0, step=10000.0)
                         p_state = st.selectbox("Estado de la República", list(ESTADOS_MEXICO.keys()))
                         
                         # Cargar listas dinámicas de usuarios
@@ -529,7 +935,7 @@ if "📋 Tablero de Proyectos" in tab_dict:
                                             created_at, target_date
                                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     ''', (
-                                        final_code, p_name, p_client, p_amount, p_amount, p_state, zone_auto,
+                                        final_code, p_name, p_client, 0.0, 0.0, p_state, zone_auto,
                                         assigned_leader, p_costos, p_ventas, "En Proceso", 1,
                                         date.today().strftime("%Y-%m-%d"), p_target.strftime("%Y-%m-%d")
                                     ))
@@ -594,8 +1000,7 @@ if "📋 Tablero de Proyectos" in tab_dict:
                 'id': 'ID Proyecto',
                 'name': 'Obra / Proyecto',
                 'client': 'Cliente',
-                'total_amount': 'Monto Inicial ($)',
-                'final_amount': 'Monto Final ($)',
+                'final_amount': 'Monto Cotizado ($)',
                 'state': 'Estado',
                 'zone': 'Zona',
                 'assigned_lider': 'Líder Regional',
@@ -617,14 +1022,13 @@ if "📋 Tablero de Proyectos" in tab_dict:
             }
             df_display['Paso Actual'] = df_display['Paso Actual'].map(steps_desc)
             
-            cols_order_display = ['ID Proyecto', 'Obra / Proyecto', 'Cliente', 'Monto Inicial ($)', 'Monto Final ($)', 'Estado', 'Zona', 'Agente de Ventas', 'Líder Regional', 'Analista de Costos', 'Paso Actual', 'Estatus Comercial']
+            cols_order_display = ['ID Proyecto', 'Obra / Proyecto', 'Cliente', 'Monto Cotizado ($)', 'Estado', 'Zona', 'Agente de Ventas', 'Líder Regional', 'Analista de Costos', 'Paso Actual', 'Estatus Comercial']
             st.dataframe(
                 df_display[cols_order_display],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Monto Inicial ($)": st.column_config.NumberColumn(format="$%,.2f"),
-                    "Monto Final ($)": st.column_config.NumberColumn(format="$%,.2f"),
+                    "Monto Cotizado ($)": st.column_config.NumberColumn(format="$%,.2f"),
                 }
             )
 
@@ -649,7 +1053,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             p = proj_dict[sel_proj_label]
             
             # Tarjetas informativas superiores
-            col_met1, col_met2, col_met3, col_met4 = st.columns(4)
+            col_met1, col_met2, col_met3, col_met4, col_met5 = st.columns(5)
             with col_met1:
                 st.metric("Agente de Ventas", p['assigned_ventas'])
             with col_met2:
@@ -657,7 +1061,20 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             with col_met3:
                 st.metric("Analista de Costos", p['assigned_costos'])
             with col_met4:
+                st.metric("Monto Cotizado ($)", f"${p['final_amount']:,.2f}")
+            with col_met5:
                 st.metric("Estatus Licitación", p['status'])
+                
+            st.markdown("<br>", unsafe_allow_html=True)
+            report_bytes = generate_docx_report(p['id'])
+            if report_bytes:
+                st.download_button(
+                    label=f"📥 Descargar Dossier Ejecutivo (Word) - {p['id']}",
+                    data=report_bytes,
+                    file_name=f"Dossier_Ejecutivo_{p['id']}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True
+                )
                 
             st.markdown("---")
             
@@ -827,7 +1244,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                     if p['step2_completed'] == 0:
                         if p['step2_ventas_done'] == 1 and p['step2_lider_done'] == 1:
                             st.info("Ambas partes han confirmado la reunión. Proceda a cargar la minuta de trabajo firmada para validar la compuerta:")
-                            if is_ventas or is_lider:
+                            if is_lider:
                                 uploaded_file_s2 = st.file_uploader("Cargar archivo de minuta de trabajo", key="uploader_s2")
                                 if uploaded_file_s2:
                                     if st.button("Guardar Minuta y Validar Paso ✔️", key="btn_s2", use_container_width=True):
@@ -846,11 +1263,13 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                         log_audit(p['id'], st.session_state.full_name, role, "Completó Paso 2: Carga de minuta de trabajo")
                                         st.success("Paso 2 completado. Paso 3 desbloqueado.")
                                         st.rerun()
+                            elif is_ventas:
+                                st.warning("📢 Esperando que el Líder Regional asignado cargue el archivo de la minuta de trabajo firmada.")
                         else:
                             st.warning("Esperando confirmación doble de 'Reunión hecha' por parte del Agente de Ventas y el Líder Regional para habilitar la carga de documentos.")
                     else:
                         st.success("✔️ Paso 2 Completado: Minuta cargada y validada por ambas partes.")
-                        if is_ventas or is_lider:
+                        if is_lider:
                             uploaded_file_s2_extra = st.file_uploader("Cargar archivo de minuta adicional", key="uploader_s2_extra")
                             if uploaded_file_s2_extra:
                                 if st.button("Subir minuta adicional", key="btn_s2_extra"):
@@ -866,6 +1285,8 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                     conn.close()
                                     st.success("Archivo subido con éxito.")
                                     st.rerun()
+                        elif is_ventas:
+                            st.info("📢 Solo el Líder Regional asignado o la Dirección pueden subir minutas de trabajo adicionales.")
 
             # ---------------------------------------------
             # PASO 3: CATÁLOGO CONCEPTOS (Líder)
