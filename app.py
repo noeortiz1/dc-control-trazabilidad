@@ -371,6 +371,11 @@ st.sidebar.markdown(f"**Puesto:** {st.session_state.user_role}")
 if st.sidebar.button("🚪 Cerrar Sesión", use_container_width=True):
     logout()
 
+st.sidebar.markdown("---")
+if st.sidebar.button("🔄 Sincronizar / Actualizar Datos", use_container_width=True):
+    st.rerun()
+st.sidebar.caption("💡 Haz clic para actualizar la pantalla y ver las cargas o cambios que haga tu equipo en tiempo real sin tener que cerrar sesión.")
+
 # ==========================================
 # CABECERA EJECUTIVA EN PANTALLA
 # ==========================================
@@ -789,26 +794,34 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                     is_ventas = (st.session_state.full_name == p['assigned_ventas'] or role == "Admin/Director") and not is_readonly
                     is_lider = (st.session_state.full_name == p['assigned_lider'] or st.session_state.user_role == p['assigned_lider'] or role == "Admin/Director") and not is_readonly
                     
-                    st.markdown("##### ☑️ Confirmación de Reunión Realizada (Doble Check Obligatorio)")
+                    st.markdown("##### ☑️ Confirmación de Reunión Realizada (Doble Check)")
                     col_chk1, col_col2 = st.columns(2)
                     with col_chk1:
-                        # Check de ventas
-                        chk_v = st.checkbox("Ventas: Reunión hecha", value=(p['step2_ventas_done'] == 1), disabled=not is_ventas, key="chk_v_s2")
-                        if chk_v != (p['step2_ventas_done'] == 1):
-                            conn = get_db_connection()
-                            conn.execute("UPDATE projects SET step2_ventas_done = ? WHERE id = ?", (1 if chk_v else 0, p['id']))
-                            conn.commit()
-                            conn.close()
-                            st.rerun()
+                        if p['step2_ventas_done'] == 1:
+                            st.success("✔️ Ventas: Reunión Confirmada")
+                        else:
+                            st.warning("⏳ Ventas: Reunión Pendiente")
+                            if is_ventas:
+                                if st.button("Confirmar Reunión (Ventas) 🤝", key="btn_confirm_v_s2", use_container_width=True):
+                                    conn = get_db_connection()
+                                    conn.execute("UPDATE projects SET step2_ventas_done = 1 WHERE id = ?", (p['id'],))
+                                    conn.commit()
+                                    conn.close()
+                                    st.success("Reunión confirmada por Ventas.")
+                                    st.rerun()
                     with col_col2:
-                        # Check de líder
-                        chk_l = st.checkbox("Líder Regional: Reunión hecha", value=(p['step2_lider_done'] == 1), disabled=not is_lider, key="chk_l_s2")
-                        if chk_l != (p['step2_lider_done'] == 1):
-                            conn = get_db_connection()
-                            conn.execute("UPDATE projects SET step2_lider_done = ? WHERE id = ?", (1 if chk_l else 0, p['id']))
-                            conn.commit()
-                            conn.close()
-                            st.rerun()
+                        if p['step2_lider_done'] == 1:
+                            st.success("✔️ Líder Regional: Reunión Confirmada")
+                        else:
+                            st.warning("⏳ Líder Regional: Reunión Pendiente")
+                            if is_lider:
+                                if st.button("Confirmar Reunión (Líder) 🤝", key="btn_confirm_l_s2", use_container_width=True):
+                                    conn = get_db_connection()
+                                    conn.execute("UPDATE projects SET step2_lider_done = 1 WHERE id = ?", (p['id'],))
+                                    conn.commit()
+                                    conn.close()
+                                    st.success("Reunión confirmada por el Líder Regional.")
+                                    st.rerun()
                             
                     # Carga de minuta
                     if p['step2_completed'] == 0:
@@ -817,7 +830,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                             if is_ventas or is_lider:
                                 uploaded_file_s2 = st.file_uploader("Cargar archivo de minuta de trabajo", key="uploader_s2")
                                 if uploaded_file_s2:
-                                    if st.button("Guardar Minuta y Validar Paso ✔️", key="btn_s2"):
+                                    if st.button("Guardar Minuta y Validar Paso ✔️", key="btn_s2", use_container_width=True):
                                         file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s2_{uploaded_file_s2.name}")
                                         with open(file_path, "wb") as f:
                                             f.write(uploaded_file_s2.getbuffer())
@@ -1007,21 +1020,15 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                     
                     if p['step5_completed'] == 0:
                         if is_authorized_s5:
-                            st.write("Revise a detalle la cotización propuesta en costo, alcance y margen. Si es correcta, confirme y firme electrónicamente:")
-                            chk_rev1 = st.checkbox("Cotización revisada en costo y alcance", key="chk_rev1")
-                            chk_rev2 = st.checkbox("Márgenes comerciales validados", key="chk_rev2")
-                            
-                            if chk_rev1 and chk_rev2:
-                                if st.button("Aprobar Cotización ✔️", key="btn_s5", type="primary"):
-                                    conn = get_db_connection()
-                                    conn.execute("UPDATE projects SET step5_completed = 1, current_stage = 6 WHERE id = ?", (p['id'],))
-                                    conn.commit()
-                                    conn.close()
-                                    log_audit(p['id'], st.session_state.full_name, role, "Aprobó y autorizó cotización")
-                                    st.success("Cotización aprobada por Dirección con éxito. Paso 6 asignado para entrega comercial.")
-                                    st.rerun()
-                            else:
-                                st.warning("Marque las casillas de verificación de costos para habilitar el botón de aprobación oficial.")
+                            st.write("Revise a detalle la cotización propuesta en costo, alcance y margen. Si es correcta, haga clic en el botón de abajo para aprobar y firmar:")
+                            if st.button("Aprobar y Autorizar Cotización ✔️", key="btn_s5", type="primary", use_container_width=True):
+                                conn = get_db_connection()
+                                conn.execute("UPDATE projects SET step5_completed = 1, current_stage = 6 WHERE id = ?", (p['id'],))
+                                conn.commit()
+                                conn.close()
+                                log_audit(p['id'], st.session_state.full_name, role, "Aprobó y autorizó cotización")
+                                st.success("Cotización aprobada por Dirección con éxito. Paso 6 asignado para entrega comercial.")
+                                st.rerun()
                         else:
                             st.info("Estatus: Esperando revisión y firma del Director General.")
                     else:
