@@ -740,6 +740,8 @@ with col_header_text:
 role = st.session_state.user_role
 if role == "Admin/Director":
     tabs_config = ["📊 Dashboard", "📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual", "👥 Usuarios y Seguridad", "📜 Bitácora Auditoría"]
+elif role in ["Director Comercial", "Director de Proyectos"]:
+    tabs_config = ["📊 Dashboard", "📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual"]
 else:
     tabs_config = ["📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual"]
 
@@ -1492,12 +1494,12 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             # ---------------------------------------------
             with step_tabs[4]:
                 st.markdown("### Paso 5: Revisión de Cotización y Aprobación de Costos")
-                st.write("**Asignado a:** Dirección General / Administrador")
+                st.write("**Asignado a:** Dirección General / Director Comercial / Director de Proyectos")
                 
                 if p['step4_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 4 para poder acceder.")
                 else:
-                    is_authorized_s5 = (role == "Admin/Director") and not is_readonly
+                    is_authorized_s5 = (role in ["Admin/Director", "Director Comercial", "Director de Proyectos"]) and not is_readonly
                     
                     # Director puede ver y descargar los archivos cargados por el analista
                     st.markdown("##### 📥 Descargar Licitación Propuesta")
@@ -1531,7 +1533,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                 st.success("Cotización aprobada por Dirección con éxito. Paso 6 asignado para entrega comercial.")
                                 st.rerun()
                         else:
-                            st.info("Estatus: Esperando revisión y firma del Director General.")
+                            st.info("Estatus: Esperando revisión y firma de la Dirección o del Director Comercial/Proyectos.")
                     else:
                         st.success("✔️ Paso 5 Completado: Cotización aprobada oficialmente por Dirección.")
 
@@ -1598,7 +1600,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             # ---------------------------------------------
             with step_tabs[6]:
                 st.markdown("### Paso 7: Cierre Comercial de Licitación")
-                st.write("**Asignado a:** Dirección General / Administrador")
+                st.write("**Asignado a:** Dirección General / Director Comercial / Director de Proyectos")
                 
                 if p['step6_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 6 para poder acceder.")
@@ -1809,7 +1811,9 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                         "Analista de Costos Jefe",
                         "Analista de Costos Junior 1",
                         "Analista de Costos Junior 2",
-                        "Ingeniero"
+                        "Ingeniero",
+                        "Director Comercial",
+                        "Director de Proyectos"
                     ])
                     
                     btn_nu = st.form_submit_button("Crear Cuenta")
