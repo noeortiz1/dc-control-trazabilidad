@@ -308,6 +308,11 @@ if 'logged_in' not in st.session_state:
     st.session_state.user_role = ""
     st.session_state.full_name = ""
 
+# Reset de seguridad para el pin de edición de perfil antes de instanciar el widget
+if st.session_state.get('clear_profile_pin', False):
+    st.session_state["sec_key_prof"] = ""
+    st.session_state['clear_profile_pin'] = False
+
 def logout():
     st.session_state.logged_in = False
     st.session_state.user_name = ""
@@ -1237,9 +1242,8 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                             conn_up_p.close()
                             
                             st.session_state.full_name = new_full_name
-                            # Reset security key in session state so it doesn't stay stuck
-                            if "sec_key_prof" in st.session_state:
-                                st.session_state["sec_key_prof"] = ""
+                            # Indicar que se debe limpiar el pin en el siguiente rerun (antes de instanciar el widget)
+                            st.session_state['clear_profile_pin'] = True
                             log_audit("SISTEMA", st.session_state.user_name, role, f"Actualizó datos de su perfil de usuario ({st.session_state.user_name})")
                             st.success("🎉 ¡Cambios guardados con éxito en tu perfil!")
                             st.rerun()
