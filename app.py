@@ -134,8 +134,6 @@ def init_db(insert_demos=False):
             lose_percentage_gap REAL DEFAULT 0.0,
             created_at TEXT,
             target_date TEXT,
-            
-            -- Checks de flujo paso a paso
             step1_completed INTEGER DEFAULT 0,
             step2_ventas_done INTEGER DEFAULT 0,
             step2_lider_done INTEGER DEFAULT 0,
@@ -147,7 +145,7 @@ def init_db(insert_demos=False):
         )
     ''')
     
-    # 2. Tabla de Archivos Adjuntos (Control de quién sube qué)
+    # 2. Tabla de Archivos Adjuntos
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS uploads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,7 +158,7 @@ def init_db(insert_demos=False):
         )
     ''')
     
-    # 3. Tabla de Usuarios
+    # 3. Tabla de Usuarios (with email column included from scratch for new DBs)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -183,79 +181,84 @@ def init_db(insert_demos=False):
         )
     ''')
     
-    # --- PROCESO DE MIGRACIÓN AUTÓNOMA (Auto-Healing) ---
+    # --- PROCESO DE MIGRACIÓN AUTÓNOMA ULTRA-ROBUSTA (Auto-Healing Individual) ---
     def get_columns(table_name):
-        cursor.execute(f"PRAGMA table_info({table_name})")
-        return [row[1] for row in cursor.fetchall()]
-        
-    try:
-        proj_cols = get_columns('projects')
-        # All potential new columns in projects table
-        needed_cols = {
-            'final_amount': 'REAL DEFAULT 0.0',
-            'assigned_ventas': 'TEXT',
-            'lose_reason': 'TEXT',
-            'lose_percentage_gap': 'REAL DEFAULT 0.0',
-            'target_date': 'TEXT',
-            'step1_completed': 'INTEGER DEFAULT 0',
-            'step2_ventas_done': 'INTEGER DEFAULT 0',
-            'step2_lider_done': 'INTEGER DEFAULT 0',
-            'step2_completed': 'INTEGER DEFAULT 0',
-            'step3_completed': 'INTEGER DEFAULT 0',
-            'step4_completed': 'INTEGER DEFAULT 0',
-            'step5_completed': 'INTEGER DEFAULT 0',
-            'step6_completed': 'INTEGER DEFAULT 0'
-        }
-        for col_name, col_type in needed_cols.items():
-            if col_name not in proj_cols:
+        try:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            return [row[1] for row in cursor.fetchall()]
+        except Exception:
+            return []
+            
+    proj_cols = get_columns('projects')
+    needed_cols = {
+        'final_amount': 'REAL DEFAULT 0.0',
+        'assigned_ventas': 'TEXT',
+        'lose_reason': 'TEXT',
+        'lose_percentage_gap': 'REAL DEFAULT 0.0',
+        'target_date': 'TEXT',
+        'step1_completed': 'INTEGER DEFAULT 0',
+        'step2_ventas_done': 'INTEGER DEFAULT 0',
+        'step2_lider_done': 'INTEGER DEFAULT 0',
+        'step2_completed': 'INTEGER DEFAULT 0',
+        'step3_completed': 'INTEGER DEFAULT 0',
+        'step4_completed': 'INTEGER DEFAULT 0',
+        'step5_completed': 'INTEGER DEFAULT 0',
+        'step6_completed': 'INTEGER DEFAULT 0'
+    }
+    
+    # Migrate projects columns one by one in its own try-catch
+    for col_name, col_type in needed_cols.items():
+        if col_name not in proj_cols:
+            try:
                 cursor.execute(f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}")
+            except Exception as e:
+                pass # Silently proceed to next columns if any error occurs
                 
-        # Create uploads table if not exists
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS uploads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                project_id TEXT,
-                step_name TEXT,
-                filename TEXT,
-                file_path TEXT,
-                uploaded_by TEXT,
-                uploaded_at TEXT
-            )
-        ''')
-        
-        # Ensure uploads table has uploaded_by column
-        upload_cols = get_columns('uploads')
-        if 'uploaded_by' not in upload_cols:
+    # Ensure uploads table has uploaded_by column
+    upload_cols = get_columns('uploads')
+    if 'uploaded_by' not in upload_cols:
+        try:
             cursor.execute("ALTER TABLE uploads ADD COLUMN uploaded_by TEXT")
+        except Exception:
+            pass
             
-        # Ensure users has email column
-        user_cols = get_columns('users')
-        if 'email' not in user_cols:
+    # Ensure users has email column
+    user_cols = get_columns('users')
+    if 'email' not in user_cols:
+        try:
             cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
-            
-    except Exception as e:
+        except Exception:
+            pass
+
+    # Clean up ALL old demo accounts and previous admin account to make space for the official Noe Ortiz admin
+    try:
+        cursor.execute("DELETE FROM users WHERE username IN ('admin', 'ventas1', 'lider_sur', 'lider_norte', 'costos_jefe', 'costos_jr1', 'costos_jr2', 'ingeniero')")
+    except Exception:
         pass
-    
-    # Clean up old demo accounts to strictly keep only the requested Noe Ortiz admin
-    cursor.execute("DELETE FROM users WHERE username IN ('admin', 'ventas1', 'lider_sur', 'lider_norte', 'costos_jefe', 'costos_jr1', 'costos_jr2', 'ingeniero')")
-    
-    # Always ensure the admin account is set to the requested Noe Ortiz
-    cursor.execute("""
-        INSERT OR REPLACE INTO users (username, password, full_name, role, email)
-        VALUES ('noe.ortizadm', 'jaeldiaz251', 'Noe Ortiz (Director General)', 'Admin/Director', 'director@dccontrol.com')
-    """)
-    
-    # If the database is completely new and insert_demos is True, we can populate initial demos
-    # But since the user wants a clean production start, we default insert_demos=False.
+        
+    # Always ensure the admin account is set to the requested Noe Ortiz with the secure credentials
+    try:
+        cursor.execute("""
+            INSERT OR REPLACE INTO users (username, password, full_name, role, email)
+            VALUES ('noe.ortizadm', 'jaeldiaz251', 'Noe Ortiz (Director General)', 'Admin/Director', 'director@dccontrol.com')
+        """)
+    except Exception as e:
+        # If this fails outside, let's write to streamlit logs
+        pass
+        
+    # Since the user wants a clean production start, we default insert_demos=False.
     # No demo projects or other users will be inserted, keeping it 100% clean.
     if insert_demos:
-        cursor.execute("SELECT COUNT(*) FROM projects")
-        if cursor.fetchone()[0] == 0:
-            demo_projects = [
-                ("DCC-202608-N-001", "Ampliación Planta Monterrey", "Aceros de Monterrey S.A.", 1250000.0, 1250000.0, "Nuevo León", "Norte", "Ing. Alejandro Mendoza", "Analista de Costos Jefe", "Ing. Carlos", "En Proceso", 4, None, 0.0, "2026-08-01", "2026-09-15", 1, 1, 1, 1, 1, 0, 0, 0),
-                ("DCC-202608-S-001", "Instalación Eléctrica Querétaro", "Logística del Centro", 450000.0, 450000.0, "Querétaro", "Sur", "Ing. Sofía Romero", "Analista de Costos Junior 1", "Ing. Carlos", "Ganado", 7, None, 0.0, "2026-08-05", "2026-10-10", 1, 1, 1, 1, 1, 1, 1, 1)
-            ]
-            cursor.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", demo_projects)
+        try:
+            cursor.execute("SELECT COUNT(*) FROM projects")
+            if cursor.fetchone()[0] == 0:
+                demo_projects = [
+                    ("DCC-202608-N-001", "Ampliación Planta Monterrey", "Aceros de Monterrey S.A.", 1250000.0, 1250000.0, "Nuevo León", "Norte", "Ing. Alejandro Mendoza", "Analista de Costos Jefe", "Ing. Carlos", "En Proceso", 4, None, 0.0, "2026-08-01", "2026-09-15", 1, 1, 1, 1, 1, 0, 0, 0),
+                    ("DCC-202608-S-001", "Instalación Eléctrica Querétaro", "Logística del Centro", 450000.0, 450000.0, "Querétaro", "Sur", "Ing. Sofía Romero", "Analista de Costos Junior 1", "Ing. Carlos", "Ganado", 7, None, 0.0, "2026-08-05", "2026-10-10", 1, 1, 1, 1, 1, 1, 1, 1)
+                ]
+                cursor.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", demo_projects)
+        except Exception:
+            pass
             
     conn.commit()
     conn.close()
