@@ -263,6 +263,8 @@ def init_db(insert_demos=False):
     conn.commit()
     conn.close()
 
+init_db(insert_demos=False)
+
 def log_audit(project_id, user_name, role, action):
     conn = get_db_connection()
     conn.execute('''
