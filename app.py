@@ -321,7 +321,10 @@ if not st.session_state.logged_in:
         with st.container(border=True):
             # Cargar logo si existe en el directorio de trabajo
             if os.path.exists("logo.png"):
-                st.image("logo.png", use_container_width=True)
+                # Squeezed columns inside container to make logo centered and beautifully resized (not oversized)
+                col_logo_l, col_logo_c, col_logo_r = st.columns([1, 1.5, 1])
+                with col_logo_c:
+                    st.image("logo.png", use_container_width=True)
             else:
                 st.markdown("<h1 style='text-align: center; color: #111827; margin-bottom: 20px;'>🏗️ DC Control</h1>", unsafe_allow_html=True)
                 
