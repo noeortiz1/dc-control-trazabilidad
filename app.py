@@ -236,14 +236,15 @@ def init_db(insert_demos=False):
     except Exception:
         pass
         
-    # Always ensure the admin account is set to the requested Noe Ortiz with the secure credentials
+    # Always ensure the admin account is set to the requested Noe Ortiz with the secure credentials (if it doesn't already exist)
     try:
-        cursor.execute("""
-            INSERT OR REPLACE INTO users (username, password, full_name, role, email)
-            VALUES ('noe.ortizadm', 'jaeldiaz251', 'Noe Ortiz (Director General)', 'Admin/Director', 'director@dccontrol.com')
-        """)
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'noe.ortizadm'")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO users (username, password, full_name, role, email)
+                VALUES ('noe.ortizadm', 'jaeldiaz251', 'Noe Ortiz (Director General)', 'Admin/Director', 'director@dccontrol.com')
+            """)
     except Exception as e:
-        # If this fails outside, let's write to streamlit logs
         pass
         
     # Since the user wants a clean production start, we default insert_demos=False.
@@ -1236,6 +1237,9 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                             conn_up_p.close()
                             
                             st.session_state.full_name = new_full_name
+                            # Reset security key in session state so it doesn't stay stuck
+                            if "sec_key_prof" in st.session_state:
+                                st.session_state["sec_key_prof"] = ""
                             log_audit("SISTEMA", st.session_state.user_name, role, f"Actualizó datos de su perfil de usuario ({st.session_state.user_name})")
                             st.success("🎉 ¡Cambios guardados con éxito en tu perfil!")
                             st.rerun()
