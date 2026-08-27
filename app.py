@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
-import sqlite3
+import psycopg2
+import psycopg2.extras
+import re
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, date, timedelta
@@ -112,12 +114,89 @@ ESTADOS_MEXICO = {
 }
 
 # ==========================================
-# GESTIÓN DE BASE DE DATOS SQLITE
+# GESTIÓN DE BASE DE DATOS POSTGRESQL (SUPABASE)
 # ==========================================
+DB_URI_PRIMARY = "postgresql://postgres:vCQhcfq72BtFbbtx@db.vtakzlcbjizdfbppgrqg.supabase.co:5432/postgres"
+DB_URI_SECONDARY = "postgresql://postgres:[vCQhcfq72BtFbbtx]@db.vtakzlcbjizdfbppgrqg.supabase.co:5432/postgres"
+
+class PostgreSQLCursorWrapper:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        
+    def execute(self, sql, params=None):
+        # Intercept SQLite-specific PRAGMA table_info and redirect to PostgreSQL information_schema
+        if "PRAGMA table_info" in sql:
+            match = re.search(r"PRAGMA table_info\((.*?)\)", sql)
+            if match:
+                table_name = match.group(1).replace("'", "").replace('"', '').strip()
+                sql_pg = f"SELECT 0 as cid, column_name as name FROM information_schema.columns WHERE table_name = '{table_name}'"
+                self._cursor.execute(sql_pg)
+                return self
+        
+        # Replace AUTOINCREMENT with SERIAL for table creation
+        if "PRIMARY KEY AUTOINCREMENT" in sql:
+            sql = sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            
+        # Replace SQLite ? placeholder with PostgreSQL %s
+        sql_pg = sql.replace('?', '%s')
+        
+        # Ensure params is a tuple/list for psycopg2
+        if params is not None:
+            if not isinstance(params, (tuple, list)):
+                params = (params,)
+        
+        self._cursor.execute(sql_pg, params)
+        return self
+        
+    def fetchone(self):
+        return self._cursor.fetchone()
+        
+    def fetchall(self):
+        return self._cursor.fetchall()
+        
+    def executemany(self, sql, seq_of_params):
+        sql_pg = sql.replace('?', '%s')
+        self._cursor.executemany(sql_pg, seq_of_params)
+        return self
+        
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+        
+    def close(self):
+        self._cursor.close()
+
+class PostgreSQLConnectionWrapper:
+    def __init__(self, conn):
+        self._conn = conn
+    
+    def cursor(self, *args, **kwargs):
+        cursor = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor, *args, **kwargs)
+        return PostgreSQLCursorWrapper(cursor)
+        
+    def execute(self, sql, params=None):
+        cursor = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cursor_wrapper = PostgreSQLCursorWrapper(cursor)
+        cursor_wrapper.execute(sql, params)
+        return cursor_wrapper
+        
+    def commit(self):
+        self._conn.commit()
+        
+    def close(self):
+        self._conn.close()
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = psycopg2.connect(DB_URI_PRIMARY, connect_timeout=5)
+        return PostgreSQLConnectionWrapper(conn)
+    except Exception:
+        try:
+            conn = psycopg2.connect(DB_URI_SECONDARY, connect_timeout=5)
+            return PostgreSQLConnectionWrapper(conn)
+        except Exception as e:
+            st.error(f"Error de conexión con Supabase: {e}")
+            raise e
 
 def init_db(insert_demos=False):
     conn = get_db_connection()
@@ -1744,7 +1823,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                                 log_audit("SISTEMA", st.session_state.full_name, role, f"Creó nuevo usuario: {nu_user}")
                                 st.success(f"Usuario {nu_user} creado con éxito.")
                                 st.rerun()
-                            except sqlite3.IntegrityError:
+                            except psycopg2.IntegrityError:
                                 st.error("El nombre de usuario ingresado ya se encuentra registrado.")
                             finally:
                                 conn.close()
