@@ -505,8 +505,15 @@ if "📋 Tablero de Proyectos" in tab_dict:
                                 region_auto = ESTADOS_MEXICO[p_state]
                                 zone_auto = "Sur" if "Sur" in region_auto else "Norte"
                                 
-                                # Mapear líder automáticamente
-                                assigned_leader = "Ing. Sofía (Líder Regional Sur)" if zone_auto == "Sur" else "Ing. Alejandro (Líder Regional Norte)"
+                                # Mapear líder automáticamente consultando la base de datos de usuarios para esa región
+                                conn_lider = get_db_connection()
+                                lider_db = conn_lider.execute("SELECT full_name FROM users WHERE role = ?", (region_auto,)).fetchone()
+                                conn_lider.close()
+                                
+                                if lider_db:
+                                    assigned_leader = lider_db['full_name']
+                                else:
+                                    assigned_leader = region_auto
                                 
                                 conn = get_db_connection()
                                 try:
@@ -780,7 +787,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 1 para poder acceder.")
                 else:
                     is_ventas = (st.session_state.full_name == p['assigned_ventas'] or role == "Admin/Director") and not is_readonly
-                    is_lider = (st.session_state.full_name == p['assigned_lider'] or role == "Admin/Director") and not is_readonly
+                    is_lider = (st.session_state.full_name == p['assigned_lider'] or st.session_state.user_role == p['assigned_lider'] or role == "Admin/Director") and not is_readonly
                     
                     st.markdown("##### ☑️ Confirmación de Reunión Realizada (Doble Check Obligatorio)")
                     col_chk1, col_col2 = st.columns(2)
@@ -859,7 +866,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                 if p['step2_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 2 para poder acceder.")
                 else:
-                    is_authorized_s3 = (st.session_state.full_name == p['assigned_lider'] or role == "Admin/Director") and not is_readonly
+                    is_authorized_s3 = (st.session_state.full_name == p['assigned_lider'] or st.session_state.user_role == p['assigned_lider'] or role == "Admin/Director") and not is_readonly
                     
                     if p['step3_completed'] == 0:
                         st.info("Estatus: Esperando catálogo de conceptos técnico por el Líder Regional.")
@@ -913,7 +920,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                 if p['step3_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 3 para poder acceder.")
                 else:
-                    is_authorized_s4 = (st.session_state.full_name == p['assigned_costos'] or role == "Admin/Director") and not is_readonly
+                    is_authorized_s4 = (st.session_state.full_name == p['assigned_costos'] or st.session_state.user_role == p['assigned_costos'] or role == "Admin/Director") and not is_readonly
                     
                     # El analista de costos ve el catálogo y puede validarlo con checks interactivos nativos
                     st.markdown("##### 📝 Verificación de Conceptos Técnicos")
@@ -1032,7 +1039,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                 if p['step5_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 5 para poder acceder.")
                 else:
-                    is_authorized_s6 = (st.session_state.full_name == p['assigned_ventas'] or role == "Admin/Director") and not is_readonly
+                    is_authorized_s6 = (st.session_state.full_name == p['assigned_ventas'] or st.session_state.user_role == p['assigned_ventas'] or role == "Admin/Director") and not is_readonly
                     
                     if p['step6_completed'] == 0:
                         st.info("Estatus: Esperando entrega formal al cliente y registro de comentarios finales.")
