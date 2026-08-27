@@ -17,7 +17,7 @@ st.set_page_config(
     page_icon="🏗️"
 )
 
-# Estilos CSS Limpios, Ejecutivos y 100% Libres de Monday/Gobernanza/etc.
+# Estilos CSS Limpios, Ejecutivos y 100% Libres de Monday/Control de Cotizaciones/etc.
 st.markdown("""
 <style>
     /* Cabecera Principal */
@@ -111,7 +111,7 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db(insert_demos=True):
+def init_db(insert_demos=False):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -183,39 +183,83 @@ def init_db(insert_demos=True):
         )
     ''')
     
-    # Inicialización de Cuentas de Acceso Reales
-    cursor.execute("SELECT COUNT(*) FROM users")
-    if cursor.fetchone()[0] == 0:
-        real_users = [
-            ("admin", "admin123", "Director General", "Admin/Director", "director@dccontrol.com"),
-            ("ventas1", "ventas123", "Ing. Carlos", "Ventas", "ventas@dccontrol.com"),
-            ("lider_sur", "sur123", "Ing. Sofía Romero", "Líder Regional - Sur", "lider.sur@dccontrol.com"),
-            ("lider_norte", "norte123", "Ing. Alejandro Mendoza", "Líder Regional - Norte", "lider.norte@dccontrol.com"),
-            ("costos_jefe", "jefe123", "Lic. Roberto", "Analista de Costos Jefe", "costos.jefe@dccontrol.com"),
-            ("costos_jr1", "jr1123", "Ing. Manuel", "Analista de Costos Junior 1", "costos.jr1@dccontrol.com"),
-            ("costos_jr2", "jr2123", "Ing. Gabriel", "Analista de Costos Junior 2", "costos.jr2@dccontrol.com"),
-            ("ingeniero", "ing123", "Ingeniero Consultor", "Ingeniero", "ingeniero@dccontrol.com")
-        ]
-        cursor.executemany("INSERT INTO users VALUES (?, ?, ?, ?, ?)", real_users)
+    # --- PROCESO DE MIGRACIÓN AUTÓNOMA (Auto-Healing) ---
+    def get_columns(table_name):
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        return [row[1] for row in cursor.fetchall()]
         
-    # Inicialización de Proyectos de Prueba (Solo si no hay datos y se solicita)
-    cursor.execute("SELECT COUNT(*) FROM projects")
-    if cursor.fetchone()[0] == 0 and insert_demos:
-        demo_projects = [
-            ("DCC-202608-N-001", "Ampliación Planta Monterrey", "Aceros de Monterrey S.A.", 1250000.0, 1250000.0, "Nuevo León", "Norte", "Ing. Alejandro Mendoza", "Analista de Costos Jefe", "Ing. Carlos", "En Proceso", 4, None, 0.0, "2026-08-01", "2026-09-15", 1, 1, 1, 1, 1, 0, 0, 0),
-            ("DCC-202608-S-001", "Instalación Eléctrica Querétaro", "Logística del Centro", 450000.0, 450000.0, "Querétaro", "Sur", "Ing. Sofía Romero", "Analista de Costos Junior 1", "Ing. Carlos", "Ganado", 7, None, 0.0, "2026-08-05", "2026-10-10", 1, 1, 1, 1, 1, 1, 1, 1)
-        ]
-        cursor.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", demo_projects)
+    try:
+        proj_cols = get_columns('projects')
+        # All potential new columns in projects table
+        needed_cols = {
+            'final_amount': 'REAL DEFAULT 0.0',
+            'assigned_ventas': 'TEXT',
+            'lose_reason': 'TEXT',
+            'lose_percentage_gap': 'REAL DEFAULT 0.0',
+            'target_date': 'TEXT',
+            'step1_completed': 'INTEGER DEFAULT 0',
+            'step2_ventas_done': 'INTEGER DEFAULT 0',
+            'step2_lider_done': 'INTEGER DEFAULT 0',
+            'step2_completed': 'INTEGER DEFAULT 0',
+            'step3_completed': 'INTEGER DEFAULT 0',
+            'step4_completed': 'INTEGER DEFAULT 0',
+            'step5_completed': 'INTEGER DEFAULT 0',
+            'step6_completed': 'INTEGER DEFAULT 0'
+        }
+        for col_name, col_type in needed_cols.items():
+            if col_name not in proj_cols:
+                cursor.execute(f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}")
+                
+        # Create uploads table if not exists
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS uploads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT,
+                step_name TEXT,
+                filename TEXT,
+                file_path TEXT,
+                uploaded_by TEXT,
+                uploaded_at TEXT
+            )
+        ''')
         
+        # Ensure uploads table has uploaded_by column
+        upload_cols = get_columns('uploads')
+        if 'uploaded_by' not in upload_cols:
+            cursor.execute("ALTER TABLE uploads ADD COLUMN uploaded_by TEXT")
+            
+        # Ensure users has email column
+        user_cols = get_columns('users')
+        if 'email' not in user_cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            
+    except Exception as e:
+        pass
+    
+    # Clean up old demo accounts to strictly keep only the requested Noe Ortiz admin
+    cursor.execute("DELETE FROM users WHERE username IN ('admin', 'ventas1', 'lider_sur', 'lider_norte', 'costos_jefe', 'costos_jr1', 'costos_jr2', 'ingeniero')")
+    
+    # Always ensure the admin account is set to the requested Noe Ortiz
+    cursor.execute("""
+        INSERT OR REPLACE INTO users (username, password, full_name, role, email)
+        VALUES ('noe.ortizadm', 'jaeldiaz251', 'Noe Ortiz (Director General)', 'Admin/Director', 'director@dccontrol.com')
+    """)
+    
+    # If the database is completely new and insert_demos is True, we can populate initial demos
+    # But since the user wants a clean production start, we default insert_demos=False.
+    # No demo projects or other users will be inserted, keeping it 100% clean.
+    if insert_demos:
+        cursor.execute("SELECT COUNT(*) FROM projects")
+        if cursor.fetchone()[0] == 0:
+            demo_projects = [
+                ("DCC-202608-N-001", "Ampliación Planta Monterrey", "Aceros de Monterrey S.A.", 1250000.0, 1250000.0, "Nuevo León", "Norte", "Ing. Alejandro Mendoza", "Analista de Costos Jefe", "Ing. Carlos", "En Proceso", 4, None, 0.0, "2026-08-01", "2026-09-15", 1, 1, 1, 1, 1, 0, 0, 0),
+                ("DCC-202608-S-001", "Instalación Eléctrica Querétaro", "Logística del Centro", 450000.0, 450000.0, "Querétaro", "Sur", "Ing. Sofía Romero", "Analista de Costos Junior 1", "Ing. Carlos", "Ganado", 7, None, 0.0, "2026-08-05", "2026-10-10", 1, 1, 1, 1, 1, 1, 1, 1)
+            ]
+            cursor.executemany("INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", demo_projects)
+            
     conn.commit()
     conn.close()
 
-# Ejecutar Inicialización
-init_db(insert_demos=True)
-
-# ==========================================
-# FUNCIONES AUXILIARES
-# ==========================================
 def log_audit(project_id, user_name, role, action):
     conn = get_db_connection()
     conn.execute('''
@@ -515,6 +559,11 @@ if "📋 Tablero de Proyectos" in tab_dict:
             st.warning("No hay proyectos registrados en este momento.")
         else:
             df_projs = pd.DataFrame([dict(p) for p in proyectos])
+            # Ensure all expected columns are present in df_projs
+            expected_db_cols = ['id', 'name', 'client', 'total_amount', 'final_amount', 'state', 'zone', 'assigned_lider', 'assigned_costos', 'assigned_ventas', 'status', 'current_stage']
+            for col in expected_db_cols:
+                if col not in df_projs.columns:
+                    df_projs[col] = 0.0 if col in ['total_amount', 'final_amount'] else None
             df_display = df_projs.rename(columns={
                 'id': 'ID Proyecto',
                 'name': 'Obra / Proyecto',
@@ -1075,6 +1124,19 @@ if "🗺️ Kanban Visual" in tab_dict:
                 st.write(f"💼 **Cliente:** {p['client']}")
                 st.write(f"💰 **Monto Cotizado:** ${p['total_amount']:,.2f}")
                 
+                # Paso actual descriptivo
+                steps_desc = {
+                    1: "Paso 1: Levantamiento (Ventas)",
+                    2: "Paso 2: Minuta Trabajo (Ventas & Líder)",
+                    3: "Paso 3: Catálogo Conceptos (Líder)",
+                    4: "Paso 4: Cotización (Costos)",
+                    5: "Paso 5: Revisión Dirección (Admin/Director)",
+                    6: "Paso 6: Entrega Cliente (Ventas)",
+                    7: "Paso 7: Cierre Comercial (Admin/Director)"
+                }
+                current_step_name = steps_desc.get(p['current_stage'], "Completado")
+                st.write(f"📋 **Estatus Actual:** {current_step_name}")
+                
                 # Barra de avance según el paso actual
                 progress_val = p['current_stage'] / 7.0
                 st.progress(progress_val)
@@ -1143,7 +1205,7 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                     st.write(f"📧 **Correo Electrónico:** {u['email'] or 'No registrado'}")
                 with col_u_action:
                     # Botón de eliminar (Sólo Admin/Director puede usarlo, no se puede eliminar a sí mismo ni a admin principal)
-                    if role == "Admin/Director" and u['username'] != st.session_state.user_name and u['username'] != 'admin':
+                    if role == "Admin/Director" and u['username'] != st.session_state.user_name and u['username'] != 'noe.ortizadm':
                         if st.button("Quitar 🗑️", key=f"del_user_{u['username']}"):
                             conn = get_db_connection()
                             conn.execute("DELETE FROM users WHERE username = ?", (u['username'],))
