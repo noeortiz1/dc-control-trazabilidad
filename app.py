@@ -1196,6 +1196,52 @@ if "👥 Usuarios y Seguridad" in tab_dict:
     with tab_dict["👥 Usuarios y Seguridad"]:
         st.subheader("👥 Configuración de Usuarios e Involucrados")
         
+        # --- SECCIÓN EDITAR MI PERFIL (PROGRESIVO CON CLAVE 1604) ---
+        st.markdown("##### 📝 Mis Datos de Perfil")
+        conn_p = get_db_connection()
+        curr_user = conn_p.execute("SELECT * FROM users WHERE username = ?", (st.session_state.user_name,)).fetchone()
+        conn_p.close()
+        
+        if curr_user:
+            with st.expander("📝 Editar mi información (Nombre, Correo, Contraseña de Acceso)", expanded=False):
+                with st.form("Edit My Profile Form"):
+                    new_full_name = st.text_input("Mi Nombre Completo", value=curr_user['full_name'])
+                    new_email = st.text_input("Mi Correo de Notificaciones", value=curr_user['email'] or "")
+                    new_pass_val = st.text_input("Nueva Contraseña de Acceso (Opcional, dejar en blanco para no cambiar)", type="password")
+                    
+                    st.markdown("🔒 **Para autorizar y guardar estos cambios, ingresa la clave de seguridad:**")
+                    security_key = st.text_input("Clave de Seguridad", type="password", key="sec_key_prof")
+                    
+                    btn_save_p = st.form_submit_button("Guardar Cambios 💾")
+                    if btn_save_p:
+                        if security_key != "1604":
+                            st.error("❌ Clave de seguridad incorrecta. No se guardaron los cambios.")
+                        elif not new_full_name or not new_email:
+                            st.error("❌ El nombre y el correo electrónico son obligatorios.")
+                        else:
+                            conn_up_p = get_db_connection()
+                            if new_pass_val.strip():
+                                conn_up_p.execute("""
+                                    UPDATE users 
+                                    SET full_name = ?, email = ?, password = ? 
+                                    WHERE username = ?
+                                """, (new_full_name, new_email, new_pass_val.strip(), st.session_state.user_name))
+                            else:
+                                conn_up_p.execute("""
+                                    UPDATE users 
+                                    SET full_name = ?, email = ? 
+                                    WHERE username = ?
+                                """, (new_full_name, new_email, st.session_state.user_name))
+                            conn_up_p.commit()
+                            conn_up_p.close()
+                            
+                            st.session_state.full_name = new_full_name
+                            log_audit("SISTEMA", st.session_state.user_name, role, f"Actualizó datos de su perfil de usuario ({st.session_state.user_name})")
+                            st.success("🎉 ¡Cambios guardados con éxito en tu perfil!")
+                            st.rerun()
+                            
+        st.markdown("---")
+        
         # Mostrar Directorio de Usuarios de forma ejecutiva como Tarjetas Nativas
         st.markdown("##### Directorio Oficial de DC Control")
         
