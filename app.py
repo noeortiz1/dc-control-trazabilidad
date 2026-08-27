@@ -116,8 +116,8 @@ ESTADOS_MEXICO = {
 # ==========================================
 # GESTIÓN DE BASE DE DATOS POSTGRESQL (SUPABASE)
 # ==========================================
-DB_URI_PRIMARY = "postgresql://postgres:vCQhcfq72BtFbbtx@db.vtakzlcbjizdfbppgrqg.supabase.co:5432/postgres"
-DB_URI_SECONDARY = "postgresql://postgres:[vCQhcfq72BtFbbtx]@db.vtakzlcbjizdfbppgrqg.supabase.co:5432/postgres"
+DB_URI_PRIMARY = "postgresql://postgres.vtakzlcbjizdfbppgrqg:vCQhcfq72BtFbbtx@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
+DB_URI_SECONDARY = "postgresql://postgres.vtakzlcbjizdfbppgrqg:vCQhcfq72BtFbbtx@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
 
 class PostgreSQLCursorWrapper:
     def __init__(self, cursor):
