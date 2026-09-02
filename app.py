@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import base64
+import zipfile
+import urllib.request
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import psycopg2
+import psycopg2.pool
 import psycopg2.extras
 import re
 import pandas as pd
@@ -167,9 +174,33 @@ class PostgreSQLCursorWrapper:
     def close(self):
         self._cursor.close()
 
+@st.cache_resource
+def get_connection_pool():
+    try:
+        pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=20,
+            dsn=DB_URI_PRIMARY,
+            connect_timeout=5
+        )
+        return pool
+    except Exception as e:
+        try:
+            pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=1,
+                maxconn=20,
+                dsn=DB_URI_SECONDARY,
+                connect_timeout=5
+            )
+            return pool
+        except Exception as ex:
+            st.error(f"Error de conexión con el Pooler de Supabase: {ex}")
+            raise ex
+
 class PostgreSQLConnectionWrapper:
-    def __init__(self, conn):
+    def __init__(self, conn, pool=None):
         self._conn = conn
+        self._pool = pool
     
     def cursor(self, *args, **kwargs):
         cursor = self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor, *args, **kwargs)
@@ -183,21 +214,408 @@ class PostgreSQLConnectionWrapper:
         
     def commit(self):
         self._conn.commit()
+        # Invalidate dashboard cache on any write operation
+        try:
+            get_cached_dashboard_stats.clear()
+        except Exception:
+            pass
         
     def close(self):
-        self._conn.close()
+        if self._pool is not None:
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        else:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+
+
+def get_system_setting(key, default=""):
+    conn = get_db_connection()
+    try:
+        row = conn.execute("SELECT val FROM system_settings WHERE key = %s", (key,)).fetchone()
+        if row:
+            return row['val']
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return default
+
+def set_system_setting(key, val):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO system_settings (key, val) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET val = EXCLUDED.val", (key, val))
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+def save_uploaded_file(uploaded_file, project_id, step_name):
+    # 1. Get raw bytes
+    file_bytes = uploaded_file.getvalue()
+    
+    # 2. Save locally as fallback/local copy
+    file_path = os.path.join(UPLOAD_DIR, f"{project_id}_{step_name}_{datetime.now().strftime('%H%M%S')}_{uploaded_file.name}")
+    try:
+        with open(file_path, "wb") as f_out:
+            f_out.write(file_bytes)
+    except Exception:
+        pass
+        
+    # 3. Save to database including bytes
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at, file_data)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ''', (project_id, step_name, uploaded_file.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), psycopg2.Binary(file_bytes)))
+        conn.commit()
+    except Exception as e:
+        st.error(f"Error al guardar archivo en base de datos: {e}")
+    finally:
+        conn.close()
+    return file_path
+
+def dispatch_step_completion_notifications(project_id, completed_step_num):
+    # Check if notifications are enabled
+    if get_system_setting("notifications_enabled", "0") != "1":
+        return
+        
+    # Get project details
+    conn = get_db_connection()
+    p = conn.execute("SELECT * FROM projects WHERE id = %s", (project_id,)).fetchone()
+    conn.close()
+    if not p:
+        return
+        
+    next_step_num = completed_step_num + 1
+    if next_step_num > 7:
+        return # Flow completed
+        
+    # Define next step name, description and assigned role/name
+    steps_meta = {
+        1: {
+            "name": "Paso 1: Levantamiento Técnico",
+            "desc": "Cargar la evidencia y datos técnicos del levantamiento de la obra.",
+            "assignee": p['assigned_ventas']
+        },
+        2: {
+            "name": "Paso 2: Reunión de Seguimiento y Minuta de Trabajo",
+            "desc": "Realizar la reunión comercial-técnica y subir la minuta de trabajo firmada por Ventas y Líder.",
+            "assignee": f"Agente Ventas ({p['assigned_ventas']}) y Líder Regional ({p['assigned_lider']})"
+        },
+        3: {
+            "name": "Paso 3: Catálogo de Conceptos Técnico",
+            "desc": "Elaborar y subir el catálogo de conceptos técnicos de ingeniería.",
+            "assignee": p['assigned_lider']
+        },
+        4: {
+            "name": "Paso 4: Elaboración de Cotización de Precios",
+            "desc": "Formular los precios unitarios, márgenes de utilidad y cargar la cotización final.",
+            "assignee": p['assigned_costos']
+        },
+        5: {
+            "name": "Paso 5: Revisión de Cotización y Aprobación de Costos",
+            "desc": "Revisión a detalle de costos, alcance y margen comercial para su firma autorizada.",
+            "assignee": "Dirección General / Comercial / Proyectos"
+        },
+        6: {
+            "name": "Paso 6: Entrega Comercial al Cliente",
+            "desc": "Entregar formalmente la propuesta al cliente final y registrar observaciones y monto entregado.",
+            "assignee": p['assigned_ventas']
+        },
+        7: {
+            "name": "Paso 7: Cierre Comercial de Licitación",
+            "desc": "Especifique el resultado comercial definitivo (Ganado / Perdido / Cancelado).",
+            "assignee": "Dirección General"
+        }
+    }
+    
+    meta = steps_meta.get(next_step_num)
+    if not meta:
+        return
+        
+    # Find email addresses for next step's assignees
+    emails = []
+    conn = get_db_connection()
+    try:
+        assignee_name = meta['assignee']
+        rows = conn.execute("SELECT email, full_name FROM users WHERE full_name = %s OR role = %s", (assignee_name, assignee_name)).fetchall()
+        for r in rows:
+            if r['email'] and "@" in r['email']:
+                emails.append((r['email'], r['full_name']))
+                
+        # If no specific email is found and it's step 5, notify all Directors
+        if next_step_num == 5:
+            directors = conn.execute("SELECT email, full_name FROM users WHERE role LIKE '%Director%'").fetchall()
+            for d in directors:
+                if d['email'] and "@" in d['email']:
+                    emails.append((d['email'], d['full_name']))
+    except Exception:
+        pass
+    finally:
+        conn.close()
+        
+    # --- 1. DISPATCH EMAIL NOTIFICATIONS ---
+    smtp_host = get_system_setting("smtp_host")
+    smtp_port = get_system_setting("smtp_port")
+    smtp_user = get_system_setting("smtp_user")
+    smtp_pass = get_system_setting("smtp_pass")
+    smtp_sender = get_system_setting("smtp_sender", "DC Control Notificaciones")
+    
+    if smtp_host and smtp_port and smtp_user and smtp_pass and emails:
+        for email, f_name in set(emails): # Deduplicate emails
+            try:
+                msg = MIMEMultipart()
+                msg['From'] = f"{smtp_sender} <{smtp_user}>"
+                msg['To'] = email
+                msg['Subject'] = f"🏗️ DC Control - Tarea Asignada: {project_id} - {p['name']}"
+                
+                body = f"""<html>
+<body style="font-family: Arial, sans-serif; color: #333333; line-height: 1.6;">
+    <div style="background-color: #111827; color: white; padding: 20px; border-radius: 6px 6px 0 0; border-left: 6px solid #00C875;">
+        <h2 style="margin: 0; font-size: 20px;">🏗️ Control de Cotizaciones - DC Control</h2>
+    </div>
+    <div style="padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 6px 6px;">
+        <p>Hola <strong>{f_name}</strong>,</p>
+        <p>Te informamos que se ha completado de manera exitosa el paso anterior en el proyecto <strong>{project_id} - {p['name']}</strong> para el cliente <strong>{p['client']}</strong>.</p>
+        
+        <p style="background-color: #f3f4f6; padding: 15px; border-radius: 4px; border-left: 4px solid #0085FF;">
+            💼 <strong>Siguiente Acción Requerida:</strong><br>
+            <span style="font-size: 16px; font-weight: bold; color: #111827;">{meta['name']}</span><br>
+            <span style="color: #4b5563;">{meta['desc']}</span>
+        </p>
+        
+        <p><strong>Responsable Asignado:</strong> {meta['assignee']}</p>
+        <p><strong>Fecha Límite Compromiso:</strong> {p['target_date']}</p>
+        
+        <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 20px 0;">
+        <p style="font-size: 13px; color: #6b7280;">Por favor, ingresa a la aplicación de escritorio de <strong>DC Control</strong> para continuar con el flujo secuencial y registrar la información técnica correspondiente.</p>
+        <p style="text-align: center; margin-top: 25px;">
+            <span style="background-color: #00C875; color: white; padding: 10px 20px; border-radius: 4px; text-decoration: none; font-weight: bold; display: inline-block;">DC Control S.A. de C.V.</span>
+        </p>
+    </div>
+</body>
+</html>"""
+                msg.attach(MIMEText(body, 'html'))
+                
+                server = smtplib.SMTP(smtp_host, int(smtp_port))
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.sendmail(smtp_user, email, msg.as_string())
+                server.quit()
+            except Exception as e:
+                pass
+                
+    # --- 2. DISPATCH TEAMS NOTIFICATION (WEBHOOK) ---
+    teams_url = get_system_setting("teams_webhook_url")
+    if teams_url and teams_url.startswith("http"):
+        try:
+            card_payload = {
+                "@type": "MessageCard",
+                "@context": "http://schema.org/extensions",
+                "themeColor": "00C875",
+                "summary": f"DC Control - Tarea Asignada {project_id}",
+                "sections": [{
+                    "activityTitle": f"🏗️ DC Control - Siguiente Paso Habilitado",
+                    "activitySubtitle": f"Proyecto: {project_id} - {p['name']}",
+                    "activityImage": "https://img.icons8.com/color/96/000000/crane.png",
+                    "facts": [
+                        {"name": "Cliente:", "value": p['client']},
+                        {"name": "Zona / Región:", "value": f"{p['state']} ({p['zone']})"},
+                        {"name": "Prioridad:", "value": p.get('priority', 'Media')},
+                        {"name": "Siguiente Tarea:", "value": meta['name']},
+                        {"name": "Asignado a:", "value": meta['assignee']},
+                        {"name": "Fecha Límite:", "value": p['target_date']}
+                    ],
+                    "markdown": True
+                }]
+            }
+            req = urllib.request.Request(
+                teams_url,
+                data=json.dumps(card_payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            with urllib.request.urlopen(req) as response:
+                pass
+        except Exception:
+            pass
+
+def generate_structured_zip_backup():
+    conn = get_db_connection()
+    try:
+        projects = conn.execute("SELECT * FROM projects").fetchall()
+        uploads = conn.execute("SELECT * FROM uploads").fetchall()
+        audit_log = conn.execute("SELECT * FROM audit_log").fetchall()
+    finally:
+        conn.close()
+        
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for p in projects:
+            p_id = p['id']
+            p_name = p['name']
+            clean_name = re.sub(r'[\\/*?:"<>|]', "", p_name).strip()
+            folder_name = f"{p_id} - {clean_name}"
+            
+            # 1. Generate Word Dossier
+            try:
+                report_bytes = generate_docx_report(p_id)
+                if report_bytes:
+                    zip_file.writestr(f"{folder_name}/Dossier_Ejecutivo_{p_id}.docx", report_bytes)
+            except Exception:
+                pass
+                
+            # 2. Metadata text file
+            try:
+                summary_text = f"""==================================================
+RESUMEN GENERAL DE LICITACIÓN COMERCIAL - DC CONTROL
+==================================================
+ID Proyecto: {p_id}
+Obra / Proyecto: {p['name']}
+Cliente: {p['client']}
+Estado / Región: {p['state']} ({p['zone']})
+Prioridad: {p.get('priority', 'Media')}
+Monto Final Cotizado: ${p['final_amount']:,.2f}
+Estatus Comercial: {p['status']}
+Paso Actual: {p['current_stage']} de 7
+
+Líder Regional Asignado: {p['assigned_lider']}
+Analista de Costos Asignado: {p['assigned_costos']}
+Agente de Ventas Asignado: {p['assigned_ventas']}
+Fecha de Registro: {p['created_at']}
+Fecha Compromiso de Entrega: {p['target_date']}
+Motivo de Cierre / Pérdida: {p['lose_reason'] or 'N/A'}
+Margen / Desfase de Precio (%): {p['lose_percentage_gap']}%
+
+ESTATUS DE COMPUERTAS SECUENCIALES:
+- Paso 1 (Levantamiento): {'Completado' if p['step1_completed'] == 1 else 'Pendiente'}
+- Paso 2 (Minuta): {'Completado' if p['step2_completed'] == 1 else 'Pendiente'}
+- Paso 3 (Catálogo): {'Completado' if p['step3_completed'] == 1 else 'Pendiente'}
+- Paso 4 (Cotización): {'Completado' if p['step4_completed'] == 1 else 'Pendiente'}
+- Paso 5 (Revisión Dirección): {'Completado' if p['step5_completed'] == 1 else 'Pendiente'}
+- Paso 6 (Entrega Cliente): {'Completado' if p['step6_completed'] == 1 else 'Pendiente'}
+=================================================="""
+                zip_file.writestr(f"{folder_name}/Resumen_Licitacion_{p_id}.txt", summary_text.encode('utf-8'))
+            except Exception:
+                pass
+                
+            # 3. Audit log text file
+            try:
+                p_logs = [log for log in audit_log if log['project_id'] == p_id]
+                log_lines = []
+                log_lines.append("==================================================")
+                log_lines.append(f"HISTORIAL DE AUDITORÍA Y TRAZABILIDAD - {p_id}")
+                log_lines.append("==================================================")
+                for l in p_logs:
+                    log_lines.append(f"[{l['timestamp']}] User: {l['user_name']} ({l['role']}) - Acción: {l['action']}")
+                log_lines.append("==================================================")
+                log_text = "\n".join(log_lines)
+                zip_file.writestr(f"{folder_name}/Bitacora_Auditoria_{p_id}.txt", log_text.encode('utf-8'))
+            except Exception:
+                pass
+                
+            # 4. Binary uploads
+            try:
+                p_uploads = [up for up in uploads if up['project_id'] == p_id]
+                for up in p_uploads:
+                    f_content = None
+                    if 'file_data' in dict(up) and up['file_data'] is not None:
+                        try:
+                            f_content = bytes(up['file_data'])
+                        except:
+                            pass
+                    if f_content is None:
+                        try:
+                            with open(up['file_path'], "rb") as f_in:
+                                f_content = f_in.read()
+                        except:
+                            pass
+                            
+                    if f_content is not None:
+                        clean_fn = re.sub(r'[\\/*?:"<>|]', "_", up['filename']).strip()
+                        zip_file.writestr(f"{folder_name}/documentos/{up['step_name']}_{clean_fn}", f_content)
+            except Exception:
+                pass
+                
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+def filter_user_projects(projects_list):
+    # If user is not logged in yet or no user_role is set, return list as is
+    if 'logged_in' not in st.session_state or not st.session_state.logged_in:
+        return projects_list
+    role = st.session_state.user_role
+    role_clean = str(role).strip().lower()
+    full_name = st.session_state.full_name
+    
+    # If the user is an Admin/Director or any Director role, they see ALL projects
+    if role_clean in ["admin/director", "director comercial", "director de proyectos"] or "director" in role_clean:
+        return projects_list
+        
+    filtered = []
+    for p in projects_list:
+        is_assigned = False
+        p_dict = dict(p)
+        # Agente de Ventas
+        if p_dict.get('assigned_ventas') and (p_dict['assigned_ventas'] == full_name or p_dict['assigned_ventas'] == role):
+            is_assigned = True
+        # Líder Regional
+        if p_dict.get('assigned_lider') and (p_dict['assigned_lider'] == full_name or p_dict['assigned_lider'] == role):
+            is_assigned = True
+        # Analista de Costos
+        if p_dict.get('assigned_costos') and (p_dict['assigned_costos'] == full_name or p_dict['assigned_costos'] == role):
+            is_assigned = True
+            
+        if is_assigned:
+            filtered.append(p)
+    return filtered
 
 def get_db_connection():
+
+    pool = get_connection_pool()
+    conn = pool.getconn()
+    return PostgreSQLConnectionWrapper(conn, pool)
+
+def save_file_directly_to_pc(data_bytes, filename):
+    import os
+    import subprocess
     try:
-        conn = psycopg2.connect(DB_URI_PRIMARY, connect_timeout=5)
-        return PostgreSQLConnectionWrapper(conn)
-    except Exception:
+        user_home = os.path.expanduser('~')
+        desktop_path = os.path.join(user_home, 'Desktop')
+        if not os.path.exists(desktop_path):
+            desktop_path = os.path.join(user_home, 'Escritorio')
+        if not os.path.exists(desktop_path):
+            desktop_path = os.path.join(user_home, 'Downloads')
+        if not os.path.exists(desktop_path):
+            desktop_path = user_home
+            
+        full_dest_path = os.path.join(desktop_path, filename)
+        with open(full_dest_path, "wb") as f_out:
+            f_out.write(data_bytes)
+            
+        st.success(f"💾 **¡Guardado con éxito!** Archivo disponible en tu Escritorio: `{full_dest_path}`")
+        
         try:
-            conn = psycopg2.connect(DB_URI_SECONDARY, connect_timeout=5)
-            return PostgreSQLConnectionWrapper(conn)
-        except Exception as e:
-            st.error(f"Error de conexión con Supabase: {e}")
-            raise e
+            os.startfile(full_dest_path)
+        except:
+            try:
+                subprocess.Popen(f'explorer /select,"{full_dest_path}"', shell=True)
+            except:
+                pass
+    except Exception as e_direct:
+        st.error(f"Error al guardar directamente en PC: {e_direct}")
 
 def init_db(insert_demos=False):
     conn = get_db_connection()
@@ -216,6 +634,8 @@ def init_db(insert_demos=False):
             assigned_lider TEXT,
             assigned_costos TEXT,
             assigned_ventas TEXT,
+            assigned_ventas_2 TEXT,
+            priority TEXT DEFAULT 'Media',
             status TEXT DEFAULT 'En Proceso',
             current_stage INTEGER DEFAULT 1,
             lose_reason TEXT,
@@ -269,8 +689,23 @@ def init_db(insert_demos=False):
         )
     ''')
     
+    # 5. Tabla de Configuración de Sistema (system_settings)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            val TEXT
+        )
+    ''')
+    
     # --- PROCESO DE MIGRACIÓN AUTÓNOMA ULTRA-ROBUSTA (Auto-Healing Individual) ---
     def get_columns(table_name):
+        try:
+            cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
+            cols = [row[0] for row in cursor.fetchall()]
+            if cols:
+                return cols
+        except Exception:
+            pass
         try:
             cursor.execute(f"PRAGMA table_info({table_name})")
             return [row[1] for row in cursor.fetchall()]
@@ -281,6 +716,8 @@ def init_db(insert_demos=False):
     needed_cols = {
         'final_amount': 'REAL DEFAULT 0.0',
         'assigned_ventas': 'TEXT',
+        'assigned_ventas_2': 'TEXT',
+        'priority': "TEXT DEFAULT 'Media'",
         'lose_reason': 'TEXT',
         'lose_percentage_gap': 'REAL DEFAULT 0.0',
         'target_date': 'TEXT',
@@ -317,6 +754,17 @@ def init_db(insert_demos=False):
             cursor.execute("ALTER TABLE users ADD COLUMN email TEXT")
         except Exception:
             pass
+            
+    # Ensure uploads table has file_data column (BYTEA in postgres, BLOB in sqlite)
+    upload_cols = get_columns('uploads')
+    if 'file_data' not in upload_cols:
+        try:
+            cursor.execute("ALTER TABLE uploads ADD COLUMN file_data BYTEA")
+        except Exception:
+            try:
+                cursor.execute("ALTER TABLE uploads ADD COLUMN file_data BLOB")
+            except Exception:
+                pass
 
     # Clean up ALL old demo accounts and previous admin account to make space for the official Noe Ortiz admin
     try:
@@ -464,18 +912,22 @@ def generate_docx_report(project_id):
     h1.paragraph_format.space_after = Pt(10)
 
     # Tabla de datos generales
-    table = doc.add_table(rows=6, cols=2)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = False
-
+    ventas_info = str(p['assigned_ventas'])
+        
     details = [
         ("Código del Proyecto", str(p['id'])),
         ("Obra / Proyecto", str(p['name'])),
         ("Cliente", str(p['client'])),
         ("Estado de la República", f"{p['state']} ({p['zone']})"),
+        ("Agente de Ventas", ventas_info),
+        ("Prioridad", str(p.get('priority', 'Media') if p.get('priority') else 'Media')),
         ("Monto Final Cotizado", f"${p['final_amount']:,.2f}"),
         ("Estatus Comercial", str(p['status']))
     ]
+    
+    table = doc.add_table(rows=len(details), cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
 
     for i, (label, val) in enumerate(details):
         row = table.rows[i]
@@ -738,15 +1190,35 @@ with col_header_text:
 
 # Definición de pestañas
 role = st.session_state.user_role
-if role == "Admin/Director":
-    tabs_config = ["📊 Dashboard", "📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual", "👥 Usuarios y Seguridad", "📜 Bitácora Auditoría"]
-elif role in ["Director Comercial", "Director de Proyectos"]:
-    tabs_config = ["📊 Dashboard", "📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual"]
+role_clean = str(role).strip().lower()
+if role_clean == "admin/director":
+    tabs_config = ["📊 Dashboard", "📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual", "👥 Usuarios y Seguridad", "⚙️ Consola de Control", "📜 Bitácora Auditoría"]
 else:
-    tabs_config = ["📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual"]
+    tabs_config = ["📊 Dashboard", "📋 Tablero de Proyectos", "✔️ Compuertas Técnicas", "🗺️ Kanban Visual"]
 
 tabs = st.tabs(tabs_config)
 tab_dict = {name: tab_obj for name, tab_obj in zip(tabs_config, tabs)}
+
+@st.cache_data(ttl=30)
+def get_cached_dashboard_stats():
+    conn = get_db_connection()
+    try:
+        total_p = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+        monto_total = conn.execute("SELECT SUM(final_amount) FROM projects").fetchone()[0] or 0.0
+        ganados_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Ganado'").fetchone()[0]
+        perdidos_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Perdido'").fetchone()[0]
+        projs_all = [dict(row) for row in conn.execute("SELECT * FROM projects").fetchall()]
+        alertas_p = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'En Proceso'").fetchone()[0]
+        return {
+            "total_p": total_p,
+            "monto_total": monto_total,
+            "ganados_n": ganados_n,
+            "perdidos_n": perdidos_n,
+            "projs_all": projs_all,
+            "alertas_p": alertas_p
+        }
+    finally:
+        conn.close()
 
 # ==========================================
 # MÓDULO 1: DASHBOARD EJECUTIVO
@@ -755,15 +1227,14 @@ if "📊 Dashboard" in tab_dict:
     with tab_dict["📊 Dashboard"]:
         st.subheader("📊 Panel de Control de Cotizaciones")
         
-        # Conexión DB y extracción rápida
-        conn = get_db_connection()
-        total_p = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
-        monto_total = conn.execute("SELECT SUM(final_amount) FROM projects").fetchone()[0] or 0.0
-        ganados_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Ganado'").fetchone()[0]
-        perdidos_n = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'Perdido'").fetchone()[0]
-        projs_all = conn.execute("SELECT * FROM projects").fetchall()
-        alertas_p = conn.execute("SELECT COUNT(*) FROM projects WHERE status = 'En Proceso'").fetchone()[0]
-        conn.close()
+        # Conexión DB y extracción rápida (Cached & Optimized)
+        stats = get_cached_dashboard_stats()
+        total_p = stats["total_p"]
+        monto_total = stats["monto_total"]
+        ganados_n = stats["ganados_n"]
+        perdidos_n = stats["perdidos_n"]
+        projs_all = stats["projs_all"]
+        alertas_p = stats["alertas_p"]
         
         # Tarjetas KPI elegantes nativas
         col_k1, col_k2, col_k3, col_k4 = st.columns(4)
@@ -781,6 +1252,102 @@ if "📊 Dashboard" in tab_dict:
         st.markdown("---")
         
         df_p = pd.DataFrame([dict(p) for p in projs_all]) if projs_all else pd.DataFrame()
+        
+        # --- SECCIÓN DE ANÁLISIS DE CUELLOS DE BOTELLA PARA REUNIONES DE 5 MINUTOS ---
+        st.markdown("### 📋 Resumen")
+        st.caption("Estatus de todas las cotizaciones activas en curso. Permite a la Dirección identificar retrasos al instante.")
+        
+        df_active_bottlenecks = df_p[df_p['status'] == 'En Proceso'].copy() if not df_p.empty else pd.DataFrame()
+        
+        if df_active_bottlenecks.empty:
+            st.success("🎉 ¡No hay proyectos en proceso! Todas las cotizaciones están cerradas o no hay proyectos en curso.")
+        else:
+            bottlenecks_data = []
+            for idx, r_b in df_active_bottlenecks.iterrows():
+                # Days left calculation
+                days_left = 999
+                try:
+                    tgt_dt = datetime.strptime(r_b['target_date'], "%Y-%m-%d").date()
+                    days_left = (tgt_dt - date.today()).days
+                except:
+                    pass
+                
+                # Casing for days remaining
+                if days_left < 0:
+                    urgencia = f"🔴 Vencido ({abs(days_left)} días)"
+                elif days_left <= 7:
+                    urgencia = f"🟠 Urgente ({days_left} días)"
+                else:
+                    urgencia = f"🟢 En Tiempo ({days_left} días)"
+                
+                # Map step to current stage and responsible
+                stg = r_b['current_stage']
+                steps_desc_map = {
+                    1: "Paso 1: Levantamiento",
+                    2: "Paso 2: Minuta Trabajo",
+                    3: "Paso 3: Catálogo Conceptos",
+                    4: "Paso 4: Cotización Precios",
+                    5: "Paso 5: Revisión Dirección",
+                    6: "Paso 6: Entrega Cliente",
+                    7: "Paso 7: Cierre Comercial"
+                }
+                step_name_friendly = steps_desc_map.get(stg, f"Paso {stg}")
+                
+                # Responsible mapping
+                if stg == 1:
+                    resp_name = r_b.get('assigned_ventas', 'Sin asignar')
+                elif stg == 2:
+                    ventas_str = r_b.get('assigned_ventas', 'Ventas')
+                    lider_str = r_b.get('assigned_lider', 'Líder Regional')
+                    resp_name = f"{ventas_str} / {lider_str}"
+                elif stg == 3:
+                    resp_name = r_b.get('assigned_lider', 'Líder Regional')
+                elif stg == 4:
+                    resp_name = r_b.get('assigned_costos', 'Analista de Costos')
+                elif stg == 5:
+                    resp_name = "Dirección General / Directores"
+                elif stg == 6:
+                    resp_name = r_b.get('assigned_ventas', 'Ventas')
+                else:
+                    resp_name = "Dirección General"
+                    
+                ventas_team = r_b.get('assigned_ventas', 'Sin asignar')
+                
+                bottlenecks_data.append({
+                    "ID Licitación": r_b['id'],
+                    "Obra / Proyecto": r_b['name'],
+                    "Cliente": r_b['client'],
+                    "Prioridad": r_b.get('priority', 'Media') if r_b.get('priority') else 'Media',
+                    "Paso Atorado": step_name_friendly,
+                    "Responsable Actual": resp_name,
+                    "Equipo de Ventas": ventas_team,
+                    "Fecha Compromiso": r_b['target_date'],
+                    "Estatus / Urgencia": urgencia,
+                    "days_sort": days_left
+                })
+                
+            df_b_display = pd.DataFrame(bottlenecks_data)
+            df_b_display = df_b_display.sort_values(by="days_sort", ascending=True).drop(columns=["days_sort"])
+            
+            p_options = ["Todos"] + [f"{r['ID Licitación']} - {r['Obra / Proyecto']}" for idx, r in df_b_display.iterrows()]
+            b_filter = st.selectbox("📂 Filtrar Resumen por Obra / Proyecto:", p_options, key="bottlenecks_filter")
+            if b_filter != "Todos":
+                b_filter_id = b_filter.split(" - ")[0]
+                df_b_display = df_b_display[df_b_display['ID Licitación'] == b_filter_id]
+            
+            st.dataframe(
+                df_b_display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Prioridad": st.column_config.TextColumn(help="Prioridad asignada por Dirección"),
+                    "Estatus / Urgencia": st.column_config.TextColumn(help="Semáforo de vencimiento"),
+                }
+            )
+            
+        st.markdown("---")
+        
+        # df_p already defined above
         
         if df_p.empty:
             st.info("No hay datos de cotizaciones registrados de momento. Comience a registrar proyectos para ver el panel de gráficas.")
@@ -964,8 +1531,9 @@ if "📋 Tablero de Proyectos" in tab_dict:
     with tab_dict["📋 Tablero de Proyectos"]:
         st.subheader("📋 Pipeline General de Proyectos")
         
-        # Opciones de creación y borrado exclusivas para el Admin/Director
-        if role == "Admin/Director":
+        # Opciones de creación y gestión exclusivas para el Admin/Director y Directores
+        role_clean = str(role).strip().lower()
+        if role_clean in ["admin/director", "director comercial", "director de proyectos"] or "director" in role_clean:
             col_admin_actions = st.columns(2)
             with col_admin_actions[0]:
                 with st.expander("➕ Crear Nuevo Registro de Licitación"):
@@ -981,7 +1549,15 @@ if "📋 Tablero de Proyectos" in tab_dict:
                         conn.close()
                         
                         p_costos = st.selectbox("Analista de Costos Asignado", cost_users if cost_users else ["Lic. Roberto (Director de Costos)"])
-                        p_ventas = st.selectbox("Agente de Ventas Responsable", sales_users if sales_users else ["Ing. Carlos"])
+                        
+                        p_comm_responsibility = st.radio("Responsable de Levantamiento y Entrega (Pasos 1 y 6)", ["Agente de Ventas", "Líder Regional"], key="p_comm_responsibility_new")
+                        if p_comm_responsibility == "Líder Regional":
+                            st.info("💡 El Líder Regional de la zona asumirá el Levantamiento y la Entrega del proyecto.")
+                            p_ventas = None
+                        else:
+                            p_ventas = st.selectbox("Agente de Ventas Responsable", sales_users if sales_users else ["Ing. Carlos"])
+                            
+                        p_priority = st.selectbox("Prioridad de Licitación", ["Alta", "Media", "Baja"], index=1)
                         p_target = st.date_input("Fecha Compromiso de Entrega")
                         
                         # Mostrar el código inteligente que se generará
@@ -1007,18 +1583,20 @@ if "📋 Tablero de Proyectos" in tab_dict:
                                     assigned_leader = lider_db['full_name']
                                 else:
                                     assigned_leader = region_auto
+                                    
+                                final_ventas = assigned_leader if p_comm_responsibility == "Líder Regional" else p_ventas
                                 
                                 conn = get_db_connection()
                                 try:
                                     conn.execute('''
                                         INSERT INTO projects (
                                             id, name, client, total_amount, final_amount, state, zone, 
-                                            assigned_lider, assigned_costos, assigned_ventas, status, current_stage, 
+                                            assigned_lider, assigned_costos, assigned_ventas, priority, status, current_stage, 
                                             created_at, target_date
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     ''', (
                                         final_code, p_name, p_client, 0.0, 0.0, p_state, zone_auto,
-                                        assigned_leader, p_costos, p_ventas, "En Proceso", 1,
+                                        assigned_leader, p_costos, final_ventas, p_priority, "En Proceso", 1,
                                         date.today().strftime("%Y-%m-%d"), p_target.strftime("%Y-%m-%d")
                                     ))
                                     conn.commit()
@@ -1031,36 +1609,157 @@ if "📋 Tablero de Proyectos" in tab_dict:
                                     conn.close()
                                     
             with col_admin_actions[1]:
-                with st.expander("🗑️ Modificar / Eliminar Registro"):
+                with st.expander("⚙️ Gestionar / Editar / Eliminar Licitación"):
                     conn = get_db_connection()
                     all_p_db = conn.execute("SELECT * FROM projects").fetchall()
                     conn.close()
                     
                     if all_p_db:
-                        p_to_del_label = st.selectbox("Seleccionar Proyecto para Operación", [f"{p['id']} - {p['name']}" for p in all_p_db])
+                        p_to_del_label = st.selectbox("Seleccionar Proyecto para Operaciones", [f"{p['id']} - {p['name']}" for p in all_p_db], key="manage_select_proj")
                         sel_del_id = p_to_del_label.split(" - ")[0]
+                        p_details = next((dict(row) for row in all_p_db if row['id'] == sel_del_id), None)
                         
-                        confirm_del = st.checkbox("Confirmo que deseo ELIMINAR permanentemente esta cotización y todos sus documentos.", key="confirm_del_check")
-                        if st.button("Eliminar permanentemente 🗑️", type="primary", disabled=not confirm_del):
-                            conn = get_db_connection()
-                            conn.execute("DELETE FROM projects WHERE id = ?", (sel_del_id,))
-                            conn.execute("DELETE FROM tasks WHERE project_id = ?", (sel_del_id,))
+                        if p_details:
+                            st.markdown("##### ✏️ Modificar Parámetros de Licitación")
                             
-                            # Borrar archivos físicos
-                            uploaded_files = conn.execute("SELECT file_path FROM uploads WHERE project_id = ?", (sel_del_id,)).fetchall()
-                            for f in uploaded_files:
-                                if f['file_path'] and os.path.exists(f['file_path']):
-                                    try:
-                                        os.remove(f['file_path'])
-                                    except:
-                                        pass
-                            conn.execute("DELETE FROM uploads WHERE project_id = ?", (sel_del_id,))
-                            conn.commit()
+                            edit_name = st.text_input("Nombre de la Obra / Proyecto", value=p_details['name'], key="edit_p_name")
+                            edit_client = st.text_input("Cliente", value=p_details['client'], key="edit_p_client")
+                            
+                            # Ensure columns are safely accessed
+                            curr_target_val = date.today()
+                            if p_details.get('target_date'):
+                                try:
+                                    curr_target_val = datetime.strptime(p_details['target_date'], "%Y-%m-%d").date()
+                                except:
+                                    pass
+                            edit_target = st.date_input("Fecha Compromiso de Entrega", value=curr_target_val, key="edit_p_target")
+                            
+                            curr_priority = p_details.get('priority', 'Media')
+                            if not curr_priority:
+                                curr_priority = 'Media'
+                            edit_priority = st.selectbox("Prioridad", ["Alta", "Media", "Baja"], index=["Alta", "Media", "Baja"].index(curr_priority) if curr_priority in ["Alta", "Media", "Baja"] else 1, key="edit_p_priority")
+                            
+                            conn = get_db_connection()
+                            cost_users = [u['full_name'] for u in conn.execute("SELECT full_name FROM users WHERE role LIKE '%Costos%'").fetchall()]
+                            sales_users = [u['full_name'] for u in conn.execute("SELECT full_name FROM users WHERE role = 'Ventas'").fetchall()]
                             conn.close()
                             
-                            log_audit(sel_del_id, st.session_state.full_name, role, "Eliminó licitación y todos sus archivos asociados.")
-                            st.success(f"Proyecto {sel_del_id} eliminado.")
-                            st.rerun()
+                            curr_costos = p_details.get('assigned_costos', '')
+                            edit_costos = st.selectbox("Analista de Costos Asignado", cost_users if cost_users else ["Lic. Roberto (Director de Costos)"], index=cost_users.index(curr_costos) if curr_costos in cost_users else 0, key="edit_p_costos")
+                            
+                            curr_ventas = p_details.get('assigned_ventas', '')
+                            curr_leader = p_details.get('assigned_lider', '')
+                            
+                            is_lider_comm_init = 1 if curr_ventas == curr_leader else 0
+                            edit_comm_responsibility = st.radio("Responsable de Levantamiento y Entrega (Pasos 1 y 6)", ["Agente de Ventas", "Líder Regional"], index=is_lider_comm_init, key="edit_p_comm_responsibility")
+                            
+                            if edit_comm_responsibility == "Líder Regional":
+                                st.info(f"💡 El Líder Regional ({curr_leader}) asumirá la responsabilidad comercial de este proyecto.")
+                                edit_ventas_val = curr_leader
+                            else:
+                                edit_ventas = st.selectbox("Agente de Ventas Responsable", sales_users if sales_users else ["Ing. Carlos"], index=sales_users.index(curr_ventas) if curr_ventas in sales_users else 0, key="edit_p_ventas")
+                                edit_ventas_val = edit_ventas
+
+                            st.markdown("---")
+                            st.markdown("##### 🛠️ Configuración de Compuertas / Pasos Omitidos")
+                            st.caption("Marque o desmarque los pasos completados manualmente. Esto le permite configurar el proyecto si ya inició o se adelantaron etapas.")
+                            
+                            col_gates1, col_gates2 = st.columns(2)
+                            with col_gates1:
+                                toggle_s1 = st.checkbox("Paso 1 Completado (Levantamiento)", value=(p_details.get('step1_completed', 0) == 1), key="chk_gate_s1")
+                                toggle_s2_v = st.checkbox("Paso 2: Reunión Confirmada por Ventas", value=(p_details.get('step2_ventas_done', 0) == 1), key="chk_gate_s2_v")
+                                toggle_s2_l = st.checkbox("Paso 2: Reunión Confirmada por Líder", value=(p_details.get('step2_lider_done', 0) == 1), key="chk_gate_s2_l")
+                                toggle_s2 = st.checkbox("Paso 2 Completado (Minuta Cargada)", value=(p_details.get('step2_completed', 0) == 1), key="chk_gate_s2")
+                            with col_gates2:
+                                toggle_s3 = st.checkbox("Paso 3 Completado (Catálogo)", value=(p_details.get('step3_completed', 0) == 1), key="chk_gate_s3")
+                                toggle_s4 = st.checkbox("Paso 4 Completado (Cotización)", value=(p_details.get('step4_completed', 0) == 1), key="chk_gate_s4")
+                                toggle_s5 = st.checkbox("Paso 5 Completado (Revisión Dirección)", value=(p_details.get('step5_completed', 0) == 1), key="chk_gate_s5")
+                                toggle_s6 = st.checkbox("Paso 6 Completado (Entrega al Cliente)", value=(p_details.get('step6_completed', 0) == 1), key="chk_gate_s6")
+                                
+                            edit_stage = st.selectbox("Ubicación Actual (Paso de la Compuerta Activa)", [
+                                "Paso 1: Levantamiento (Ventas)",
+                                "Paso 2: Minuta (Ventas & Líder)",
+                                "Paso 3: Catálogo Conceptos (Líder)",
+                                "Paso 4: Cotización (Costos)",
+                                "Paso 5: Revisión y Aprobación (Dirección)",
+                                "Paso 6: Entrega al Cliente (Ventas)",
+                                "Paso 7: Cierre Comercial (Dirección)"
+                            ], index=max(0, min(6, p_details.get('current_stage', 1) - 1)), key="edit_p_stage")
+                            
+                            edit_stage_val = [
+                                "Paso 1: Levantamiento (Ventas)",
+                                "Paso 2: Minuta (Ventas & Líder)",
+                                "Paso 3: Catálogo Conceptos (Líder)",
+                                "Paso 4: Cotización (Costos)",
+                                "Paso 5: Revisión y Aprobación (Dirección)",
+                                "Paso 6: Entrega al Cliente (Ventas)",
+                                "Paso 7: Cierre Comercial (Dirección)"
+                            ].index(edit_stage) + 1
+
+                            if st.button("Guardar Cambios 💾", type="primary", use_container_width=True, key="save_edit_p_btn"):
+                                if not edit_name or not edit_client:
+                                    st.error("El nombre y el cliente son campos obligatorios.")
+                                else:
+                                    prev_stage = p_details.get('current_stage', 1) if p_details else 1
+                                    conn = get_db_connection()
+                                    conn.execute('''
+                                        UPDATE projects 
+                                        SET name = ?, client = ?, target_date = ?, priority = ?, assigned_costos = ?, assigned_ventas = ?,
+                                            step1_completed = ?, step2_ventas_done = ?, step2_lider_done = ?, step2_completed = ?,
+                                            step3_completed = ?, step4_completed = ?, step5_completed = ?, step6_completed = ?,
+                                            current_stage = ?
+                                        WHERE id = ?
+                                    ''', (
+                                        edit_name, edit_client, edit_target.strftime("%Y-%m-%d"), edit_priority, edit_costos, edit_ventas_val,
+                                        1 if toggle_s1 else 0, 1 if toggle_s2_v else 0, 1 if toggle_s2_l else 0, 1 if toggle_s2 else 0,
+                                        1 if toggle_s3 else 0, 1 if toggle_s4 else 0, 1 if toggle_s5 else 0, 1 if toggle_s6 else 0,
+                                        edit_stage_val, sel_del_id
+                                    ))
+                                    conn.commit()
+                                    conn.close()
+                                    
+                                    # Trigger notifications if stage advanced
+                                    if edit_stage_val > prev_stage:
+                                        dispatch_step_completion_notifications(sel_del_id, edit_stage_val - 1)
+                                    
+                                    # Invalidate cache
+                                    try:
+                                        get_cached_dashboard_stats.clear()
+                                    except:
+                                        pass
+                                        
+                                    log_audit(sel_del_id, st.session_state.full_name, role, f"Modificó licitación {sel_del_id} (Prioridad: {edit_priority}, Fecha de entrega: {edit_target.strftime('%Y-%m-%d')})")
+                                    st.success(f"Cambios en proyecto {sel_del_id} guardados con éxito.")
+                                    st.rerun()
+                                    
+                            st.markdown("---")
+                            st.markdown("##### 🚨 Zona de Peligro")
+                            confirm_del = st.checkbox("Confirmo que deseo ELIMINAR permanentemente esta cotización y todos sus documentos.", key="confirm_del_check")
+                            if st.button("Eliminar permanentemente 🗑️", type="primary", disabled=not confirm_del, key="delete_p_btn"):
+                                conn = get_db_connection()
+                                conn.execute("DELETE FROM projects WHERE id = ?", (sel_del_id,))
+                                
+                                # Borrar archivos físicos
+                                uploaded_files = conn.execute("SELECT file_path FROM uploads WHERE project_id = ?", (sel_del_id,)).fetchall()
+                                for f in uploaded_files:
+                                    if f['file_path'] and os.path.exists(f['file_path']):
+                                        try:
+                                            os.remove(f['file_path'])
+                                        except:
+                                            pass
+                                conn.execute("DELETE FROM uploads WHERE project_id = ?", (sel_del_id,))
+                                conn.commit()
+                                conn.close()
+                                
+                                # Invalidate cache
+                                try:
+                                    get_cached_dashboard_stats.clear()
+                                except:
+                                    pass
+                                    
+                                log_audit(sel_del_id, st.session_state.full_name, role, "Eliminó licitación y todos sus archivos asociados.")
+                                st.success(f"Proyecto {sel_del_id} eliminado.")
+                                st.rerun()
                     else:
                         st.caption("No hay proyectos en base de datos")
 
@@ -1068,16 +1767,22 @@ if "📋 Tablero de Proyectos" in tab_dict:
         conn = get_db_connection()
         proyectos = conn.execute("SELECT * FROM projects").fetchall()
         conn.close()
+        proyectos = filter_user_projects([dict(r) for r in proyectos])
         
         if not proyectos:
             st.warning("No hay proyectos registrados en este momento.")
         else:
             df_projs = pd.DataFrame([dict(p) for p in proyectos])
             # Ensure all expected columns are present in df_projs
-            expected_db_cols = ['id', 'name', 'client', 'total_amount', 'final_amount', 'state', 'zone', 'assigned_lider', 'assigned_costos', 'assigned_ventas', 'status', 'current_stage']
+            expected_db_cols = ['id', 'name', 'client', 'total_amount', 'final_amount', 'state', 'zone', 'assigned_lider', 'assigned_costos', 'assigned_ventas', 'assigned_ventas_2', 'priority', 'status', 'current_stage']
             for col in expected_db_cols:
                 if col not in df_projs.columns:
                     df_projs[col] = 0.0 if col in ['total_amount', 'final_amount'] else None
+            
+            # Sort by Priority categories
+            df_projs['priority_sort'] = pd.Categorical(df_projs['priority'].fillna('Media'), categories=['Alta', 'Media', 'Baja'], ordered=True)
+            df_projs = df_projs.sort_values(by=['priority_sort', 'id'], ascending=[True, False]).drop(columns=['priority_sort'])
+            
             df_display = df_projs.rename(columns={
                 'id': 'ID Proyecto',
                 'name': 'Obra / Proyecto',
@@ -1088,6 +1793,8 @@ if "📋 Tablero de Proyectos" in tab_dict:
                 'assigned_lider': 'Líder Regional',
                 'assigned_costos': 'Analista de Costos',
                 'assigned_ventas': 'Agente de Ventas',
+                'assigned_ventas_2': 'Agente Ventas 2',
+                'priority': 'Prioridad',
                 'status': 'Estatus Comercial',
                 'current_stage': 'Paso Actual'
             })
@@ -1104,7 +1811,7 @@ if "📋 Tablero de Proyectos" in tab_dict:
             }
             df_display['Paso Actual'] = df_display['Paso Actual'].map(steps_desc)
             
-            cols_order_display = ['ID Proyecto', 'Obra / Proyecto', 'Cliente', 'Monto Cotizado ($)', 'Estado', 'Zona', 'Agente de Ventas', 'Líder Regional', 'Analista de Costos', 'Paso Actual', 'Estatus Comercial']
+            cols_order_display = ['ID Proyecto', 'Obra / Proyecto', 'Cliente', 'Monto Cotizado ($)', 'Estado', 'Zona', 'Agente de Ventas', 'Líder Regional', 'Analista de Costos', 'Prioridad', 'Paso Actual', 'Estatus Comercial']
             st.dataframe(
                 df_display[cols_order_display],
                 use_container_width=True,
@@ -1125,6 +1832,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
         conn = get_db_connection()
         projs = conn.execute("SELECT * FROM projects").fetchall()
         conn.close()
+        projs = filter_user_projects([dict(r) for r in projs])
         
         if not projs:
             st.info("No hay proyectos registrados para procesar.")
@@ -1147,16 +1855,23 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             with col_met5:
                 st.metric("Estatus Licitación", p['status'])
                 
+            st.markdown(f"**Prioridad:** `{p.get('priority', 'Media') if p.get('priority') else 'Media'}`  |  **Fecha Límite de Entrega Comercial:** `{p.get('target_date', 'No definida')}`")
+                
             st.markdown("<br>", unsafe_allow_html=True)
             report_bytes = generate_docx_report(p['id'])
             if report_bytes:
-                st.download_button(
-                    label=f"📥 Descargar Dossier Ejecutivo (Word) - {p['id']}",
-                    data=report_bytes,
-                    file_name=f"Dossier_Ejecutivo_{p['id']}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True
-                )
+                col_d_dl, col_d_save = st.columns(2)
+                with col_d_dl:
+                    st.download_button(
+                        label=f"📥 Descargar Dossier (Web)",
+                        data=report_bytes,
+                        file_name=f"Dossier_Ejecutivo_{p['id']}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True
+                    )
+                with col_d_save:
+                    if st.button(f"💾 Guardar en Escritorio (Word)", key=f"save_pc_dossier_{p['id']}", use_container_width=True):
+                        save_file_directly_to_pc(report_bytes, f"Dossier_Ejecutivo_{p['id']}.docx")
                 
             st.markdown("---")
             
@@ -1186,21 +1901,39 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                     st.caption("No se han cargado documentos en este paso.")
                 else:
                     for f in files:
-                        col_file_name, col_file_dl, col_file_del = st.columns([3, 1, 1])
+                        col_file_name, col_file_dl, col_file_del = st.columns([3, 2, 1])
                         with col_file_name:
                             st.write(f"📄 {f['filename']} (Subido por: {f['uploaded_by']})")
                         with col_file_dl:
-                            # Descargar archivo
-                            try:
-                                with open(f['file_path'], "rb") as file_bytes:
+                            # Descargar archivo (Global DB-driven fallback to local disk)
+                            f_content = None
+                            if 'file_data' in dict(f) and f['file_data'] is not None:
+                                try:
+                                    f_content = bytes(f['file_data'])
+                                except Exception:
+                                    pass
+                            if f_content is None:
+                                try:
+                                    with open(f['file_path'], "rb") as file_bytes:
+                                        f_content = file_bytes.read()
+                                except:
+                                    pass
+                                    
+                            if f_content is not None:
+                                col_inner_dl, col_inner_save = st.columns(2)
+                                with col_inner_dl:
                                     st.download_button(
-                                        label="Descargar 📥",
-                                        data=file_bytes.read(),
+                                        label="Web 📥",
+                                        data=f_content,
                                         file_name=f['filename'],
-                                        key=f"dl_{f['id']}"
+                                        key=f"dl_{f['id']}",
+                                        use_container_width=True
                                     )
-                            except:
-                                st.error("Archivo no encontrado")
+                                with col_inner_save:
+                                    if st.button("PC 💾", key=f"save_pc_att_{f['id']}", use_container_width=True):
+                                        save_file_directly_to_pc(f_content, f['filename'])
+                            else:
+                                st.error("Archivo no disponible")
                         with col_file_del:
                             # Eliminar archivo (Solo si es quien lo cargó o Admin, y no es visualizador)
                             if not is_readonly and (active_user == f['uploaded_by'] or role == "Admin/Director"):
@@ -1226,7 +1959,10 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             # ---------------------------------------------
             with step_tabs[0]:
                 st.markdown("### Paso 1: Crear Levantamiento Técnico")
-                st.write(f"**Asignado a:** Agente de Ventas - *{p['assigned_ventas']}*")
+                if p['assigned_ventas'] == p['assigned_lider']:
+                    st.write(f"**Asignado a:** Líder Regional - *{p['assigned_ventas']}* (Asignación Directa)")
+                else:
+                    st.write(f"**Asignado a:** Agente de Ventas - *{p['assigned_ventas']}*")
                 
                 # Desplegar Archivos
                 display_files_interface(p['id'], "step1_levantamiento", st.session_state.user_name, is_readonly)
@@ -1240,19 +1976,12 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                         uploaded_file_s1 = st.file_uploader("Cargar evidencia de levantamiento (PDF, Imagen, Word, etc.)", key="uploader_s1")
                         if uploaded_file_s1:
                             if st.button("Guardar Evidencia y Validar Paso ✔️", key="btn_s1"):
-                                # Guardar en disco
-                                file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s1_{uploaded_file_s1.name}")
-                                with open(file_path, "wb") as f:
-                                    f.write(uploaded_file_s1.getbuffer())
-                                    
+                                file_path = save_uploaded_file(uploaded_file_s1, p['id'], "step1_levantamiento")
                                 conn = get_db_connection()
-                                conn.execute('''
-                                    INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                ''', (p['id'], "step1_levantamiento", uploaded_file_s1.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                                 conn.execute("UPDATE projects SET step1_completed = 1, current_stage = 2 WHERE id = ?", (p['id'],))
                                 conn.commit()
                                 conn.close()
+                                dispatch_step_completion_notifications(p['id'], 1)
                                 log_audit(p['id'], st.session_state.full_name, role, "Completó Paso 1: Carga de levantamiento")
                                 st.success("Paso 1 completado con éxito. Paso 2 desbloqueado.")
                                 st.rerun()
@@ -1263,16 +1992,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                         uploaded_file_s1_extra = st.file_uploader("Cargar archivo adicional", key="uploader_s1_extra")
                         if uploaded_file_s1_extra:
                             if st.button("Subir archivo adicional", key="btn_s1_extra"):
-                                file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s1_{datetime.now().strftime('%H%M%S')}_{uploaded_file_s1_extra.name}")
-                                with open(file_path, "wb") as f:
-                                    f.write(uploaded_file_s1_extra.getbuffer())
-                                conn = get_db_connection()
-                                conn.execute('''
-                                    INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                    VALUES (?, ?, ?, ?, ?, ?)
-                                ''', (p['id'], "step1_levantamiento", uploaded_file_s1_extra.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                                conn.commit()
-                                conn.close()
+                                file_path = save_uploaded_file(uploaded_file_s1_extra, p['id'], "step1_levantamiento")
                                 st.success("Archivo subido con éxito.")
                                 st.rerun()
 
@@ -1281,8 +2001,13 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             # ---------------------------------------------
             with step_tabs[1]:
                 st.markdown("### Paso 2: Reunión de Seguimiento y Minuta de Trabajo")
-                st.write(f"**Ventas Responsable:** {p['assigned_ventas']}")
-                st.write(f"**Líder Regional Responsable:** {p['assigned_lider']}")
+                
+                is_lider_commercial = (p['assigned_ventas'] == p['assigned_lider'])
+                if is_lider_commercial:
+                    st.write(f"**Ventas & Líder Regional Responsable (Mismo Rol):** {p['assigned_lider']}")
+                else:
+                    st.write(f"**Ventas Responsable:** {p['assigned_ventas']}")
+                    st.write(f"**Líder Regional Responsable:** {p['assigned_lider']}")
                 
                 display_files_interface(p['id'], "step2_minuta", st.session_state.user_name, is_readonly)
                 
@@ -1293,34 +2018,49 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                     is_ventas = (st.session_state.full_name == p['assigned_ventas'] or role == "Admin/Director") and not is_readonly
                     is_lider = (st.session_state.full_name == p['assigned_lider'] or st.session_state.user_role == p['assigned_lider'] or role == "Admin/Director") and not is_readonly
                     
-                    st.markdown("##### ☑️ Confirmación de Reunión Realizada (Doble Check)")
-                    col_chk1, col_col2 = st.columns(2)
-                    with col_chk1:
-                        if p['step2_ventas_done'] == 1:
-                            st.success("✔️ Ventas: Reunión Confirmada")
-                        else:
-                            st.warning("⏳ Ventas: Reunión Pendiente")
-                            if is_ventas:
-                                if st.button("Confirmar Reunión (Ventas) 🤝", key="btn_confirm_v_s2", use_container_width=True):
-                                    conn = get_db_connection()
-                                    conn.execute("UPDATE projects SET step2_ventas_done = 1 WHERE id = ?", (p['id'],))
-                                    conn.commit()
-                                    conn.close()
-                                    st.success("Reunión confirmada por Ventas.")
-                                    st.rerun()
-                    with col_col2:
+                    if is_lider_commercial:
+                        st.markdown("##### ☑️ Confirmación de Reunión Realizada")
                         if p['step2_lider_done'] == 1:
-                            st.success("✔️ Líder Regional: Reunión Confirmada")
+                            st.success("✔️ Líder Regional (Responsable Único): Reunión Confirmada")
                         else:
                             st.warning("⏳ Líder Regional: Reunión Pendiente")
                             if is_lider:
-                                if st.button("Confirmar Reunión (Líder) 🤝", key="btn_confirm_l_s2", use_container_width=True):
+                                if st.button("Confirmar Reunión 🤝", key="btn_confirm_l_s2_single", use_container_width=True):
                                     conn = get_db_connection()
-                                    conn.execute("UPDATE projects SET step2_lider_done = 1 WHERE id = ?", (p['id'],))
+                                    conn.execute("UPDATE projects SET step2_lider_done = 1, step2_ventas_done = 1 WHERE id = ?", (p['id'],))
                                     conn.commit()
                                     conn.close()
-                                    st.success("Reunión confirmada por el Líder Regional.")
+                                    st.success("Reunión confirmada.")
                                     st.rerun()
+                    else:
+                        st.markdown("##### ☑️ Confirmación de Reunión Realizada (Doble Check)")
+                        col_chk1, col_col2 = st.columns(2)
+                        with col_chk1:
+                            if p['step2_ventas_done'] == 1:
+                                st.success("✔️ Ventas: Reunión Confirmada")
+                            else:
+                                st.warning("⏳ Ventas: Reunión Pendiente")
+                                if is_ventas:
+                                    if st.button("Confirmar Reunión (Ventas) 🤝", key="btn_confirm_v_s2", use_container_width=True):
+                                        conn = get_db_connection()
+                                        conn.execute("UPDATE projects SET step2_ventas_done = 1 WHERE id = ?", (p['id'],))
+                                        conn.commit()
+                                        conn.close()
+                                        st.success("Reunión confirmada por Ventas.")
+                                        st.rerun()
+                        with col_col2:
+                            if p['step2_lider_done'] == 1:
+                                st.success("✔️ Líder Regional: Reunión Confirmada")
+                            else:
+                                st.warning("⏳ Líder Regional: Reunión Pendiente")
+                                if is_lider:
+                                    if st.button("Confirmar Reunión (Líder) 🤝", key="btn_confirm_l_s2", use_container_width=True):
+                                        conn = get_db_connection()
+                                        conn.execute("UPDATE projects SET step2_lider_done = 1 WHERE id = ?", (p['id'],))
+                                        conn.commit()
+                                        conn.close()
+                                        st.success("Reunión confirmada por el Líder Regional.")
+                                        st.rerun()
                             
                     # Carga de minuta
                     if p['step2_completed'] == 0:
@@ -1330,44 +2070,29 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                 uploaded_file_s2 = st.file_uploader("Cargar archivo de minuta de trabajo", key="uploader_s2")
                                 if uploaded_file_s2:
                                     if st.button("Guardar Minuta y Validar Paso ✔️", key="btn_s2", use_container_width=True):
-                                        file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s2_{uploaded_file_s2.name}")
-                                        with open(file_path, "wb") as f:
-                                            f.write(uploaded_file_s2.getbuffer())
-                                            
+                                        file_path = save_uploaded_file(uploaded_file_s2, p['id'], "step2_minuta")
                                         conn = get_db_connection()
-                                        conn.execute('''
-                                            INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                            VALUES (?, ?, ?, ?, ?, ?)
-                                        ''', (p['id'], "step2_minuta", uploaded_file_s2.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                                         conn.execute("UPDATE projects SET step2_completed = 1, current_stage = 3 WHERE id = ?", (p['id'],))
                                         conn.commit()
                                         conn.close()
+                                        dispatch_step_completion_notifications(p['id'], 2)
                                         log_audit(p['id'], st.session_state.full_name, role, "Completó Paso 2: Carga de minuta de trabajo")
                                         st.success("Paso 2 completado. Paso 3 desbloqueado.")
                                         st.rerun()
-                            elif is_ventas:
+                            elif is_ventas and not is_lider_commercial:
                                 st.warning("📢 Esperando que el Líder Regional asignado cargue el archivo de la minuta de trabajo firmada.")
                         else:
-                            st.warning("Esperando confirmación doble de 'Reunión hecha' por parte del Agente de Ventas y el Líder Regional para habilitar la carga de documentos.")
+                            st.warning("Esperando confirmación de 'Reunión hecha' para habilitar la carga de documentos.")
                     else:
-                        st.success("✔️ Paso 2 Completado: Minuta cargada y validada por ambas partes.")
+                        st.success("✔️ Paso 2 Completado: Minuta cargada y validada.")
                         if is_lider:
                             uploaded_file_s2_extra = st.file_uploader("Cargar archivo de minuta adicional", key="uploader_s2_extra")
                             if uploaded_file_s2_extra:
                                 if st.button("Subir minuta adicional", key="btn_s2_extra"):
-                                    file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s2_{datetime.now().strftime('%H%M%S')}_{uploaded_file_s2_extra.name}")
-                                    with open(file_path, "wb") as f:
-                                        f.write(uploaded_file_s2_extra.getbuffer())
-                                    conn = get_db_connection()
-                                    conn.execute('''
-                                        INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                        VALUES (?, ?, ?, ?, ?, ?)
-                                    ''', (p['id'], "step2_minuta", uploaded_file_s2_extra.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                                    conn.commit()
-                                    conn.close()
+                                    file_path = save_uploaded_file(uploaded_file_s2_extra, p['id'], "step2_minuta")
                                     st.success("Archivo subido con éxito.")
                                     st.rerun()
-                        elif is_ventas:
+                        elif is_ventas and not is_lider_commercial:
                             st.info("📢 Solo el Líder Regional asignado o la Dirección pueden subir minutas de trabajo adicionales.")
 
             # ---------------------------------------------
@@ -1390,18 +2115,12 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                             uploaded_file_s3 = st.file_uploader("Cargar Catálogo de Conceptos (Excel, PDF)", key="uploader_s3")
                             if uploaded_file_s3:
                                 if st.button("Guardar Catálogo y Validar Paso ✔️", key="btn_s3"):
-                                    file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s3_{uploaded_file_s3.name}")
-                                    with open(file_path, "wb") as f:
-                                        f.write(uploaded_file_s3.getbuffer())
-                                        
+                                    file_path = save_uploaded_file(uploaded_file_s3, p['id'], "step3_catalogo")
                                     conn = get_db_connection()
-                                    conn.execute('''
-                                        INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                        VALUES (?, ?, ?, ?, ?, ?)
-                                    ''', (p['id'], "step3_catalogo", uploaded_file_s3.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                                     conn.execute("UPDATE projects SET step3_completed = 1, current_stage = 4 WHERE id = ?", (p['id'],))
                                     conn.commit()
                                     conn.close()
+                                    dispatch_step_completion_notifications(p['id'], 3)
                                     log_audit(p['id'], st.session_state.full_name, role, "Completó Paso 3: Carga de catálogo de conceptos")
                                     st.success("Paso 3 completado. Paso 4 desbloqueado.")
                                     st.rerun()
@@ -1411,16 +2130,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                             uploaded_file_s3_extra = st.file_uploader("Cargar archivo técnico adicional", key="uploader_s3_extra")
                             if uploaded_file_s3_extra:
                                 if st.button("Subir archivo adicional", key="btn_s3_extra"):
-                                    file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s3_{datetime.now().strftime('%H%M%S')}_{uploaded_file_s3_extra.name}")
-                                    with open(file_path, "wb") as f:
-                                        f.write(uploaded_file_s3_extra.getbuffer())
-                                    conn = get_db_connection()
-                                    conn.execute('''
-                                        INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                        VALUES (?, ?, ?, ?, ?, ?)
-                                    ''', (p['id'], "step3_catalogo", uploaded_file_s3_extra.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                                    conn.commit()
-                                    conn.close()
+                                    file_path = save_uploaded_file(uploaded_file_s3_extra, p['id'], "step3_catalogo")
                                     st.success("Archivo subido con éxito.")
                                     st.rerun()
 
@@ -1453,18 +2163,12 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                             if uploaded_file_s4:
                                 if chk_c1 and chk_c2 and chk_c3:
                                     if st.button("Cargar Cotización y Validar Paso ✔️", key="btn_s4"):
-                                        file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s4_{uploaded_file_s4.name}")
-                                        with open(file_path, "wb") as f:
-                                            f.write(uploaded_file_s4.getbuffer())
-                                            
+                                        file_path = save_uploaded_file(uploaded_file_s4, p['id'], "step4_cotizacion")
                                         conn = get_db_connection()
-                                        conn.execute('''
-                                            INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                            VALUES (?, ?, ?, ?, ?, ?)
-                                        ''', (p['id'], "step4_cotizacion", uploaded_file_s4.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
                                         conn.execute("UPDATE projects SET step4_completed = 1, current_stage = 5 WHERE id = ?", (p['id'],))
                                         conn.commit()
                                         conn.close()
+                                        dispatch_step_completion_notifications(p['id'], 4)
                                         log_audit(p['id'], st.session_state.full_name, role, "Completó Paso 4: Elaboró y cargó cotización")
                                         st.success("Paso 4 completado con éxito. Paso 5 desbloqueado para revisión de dirección.")
                                         st.rerun()
@@ -1476,16 +2180,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                             uploaded_file_s4_extra = st.file_uploader("Cargar archivo de cotización adicional", key="uploader_s4_extra")
                             if uploaded_file_s4_extra:
                                 if st.button("Subir cotización adicional", key="btn_s4_extra"):
-                                    file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s4_{datetime.now().strftime('%H%M%S')}_{uploaded_file_s4_extra.name}")
-                                    with open(file_path, "wb") as f:
-                                        f.write(uploaded_file_s4_extra.getbuffer())
-                                    conn = get_db_connection()
-                                    conn.execute('''
-                                        INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                        VALUES (?, ?, ?, ?, ?, ?)
-                                    ''', (p['id'], "step4_cotizacion", uploaded_file_s4_extra.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                                    conn.commit()
-                                    conn.close()
+                                    file_path = save_uploaded_file(uploaded_file_s4_extra, p['id'], "step4_cotizacion")
                                     st.success("Archivo subido con éxito.")
                                     st.rerun()
 
@@ -1499,7 +2194,8 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                 if p['step4_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 4 para poder acceder.")
                 else:
-                    is_authorized_s5 = (role in ["Admin/Director", "Director Comercial", "Director de Proyectos"]) and not is_readonly
+                    role_clean = str(role).strip().lower()
+                    is_authorized_s5 = (role_clean in ["admin/director", "director comercial", "director de proyectos"] or "director" in role_clean) and not is_readonly
                     
                     # Director puede ver y descargar los archivos cargados por el analista
                     st.markdown("##### 📥 Descargar Licitación Propuesta")
@@ -1508,16 +2204,35 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                         st.caption("No hay propuesta cargada.")
                     else:
                         for f in files_proposal:
-                            try:
-                                with open(f['file_path'], "rb") as file_bytes:
+                            # Global DB-driven fallback to local disk
+                            f_content = None
+                            if 'file_data' in dict(f) and f['file_data'] is not None:
+                                try:
+                                    f_content = bytes(f['file_data'])
+                                except Exception:
+                                    pass
+                            if f_content is None:
+                                try:
+                                    with open(f['file_path'], "rb") as file_bytes:
+                                        f_content = file_bytes.read()
+                                except:
+                                    pass
+                                    
+                            if f_content is not None:
+                                col_prop_dl, col_prop_save = st.columns(2)
+                                with col_prop_dl:
                                     st.download_button(
-                                        label=f"Descargar Propuesta: {f['filename']} 📥",
-                                        data=file_bytes.read(),
+                                        label=f"Descargar (Web): {f['filename']} 📥",
+                                        data=f_content,
                                         file_name=f['filename'],
-                                        key=f"proposal_dl_{f['id']}"
+                                        key=f"proposal_dl_{f['id']}",
+                                        use_container_width=True
                                     )
-                            except:
-                                pass
+                                with col_prop_save:
+                                    if st.button(f"Guardar en PC 💾: {f['filename']}", key=f"proposal_save_{f['id']}", use_container_width=True):
+                                        save_file_directly_to_pc(f_content, f['filename'])
+                            else:
+                                st.caption(f"⚠️ {f['filename']} (No disponible)")
                                 
                     st.markdown("---")
                     
@@ -1529,6 +2244,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                 conn.execute("UPDATE projects SET step5_completed = 1, current_stage = 6 WHERE id = ?", (p['id'],))
                                 conn.commit()
                                 conn.close()
+                                dispatch_step_completion_notifications(p['id'], 5)
                                 log_audit(p['id'], st.session_state.full_name, role, "Aprobó y autorizó cotización")
                                 st.success("Cotización aprobada por Dirección con éxito. Paso 6 asignado para entrega comercial.")
                                 st.rerun()
@@ -1542,7 +2258,10 @@ if "✔️ Compuertas Técnicas" in tab_dict:
             # ---------------------------------------------
             with step_tabs[5]:
                 st.markdown("### Paso 6: Entrega de Cotización al Cliente")
-                st.write(f"**Asignado a:** Agente de Ventas - *{p['assigned_ventas']}*")
+                if p['assigned_ventas'] == p['assigned_lider']:
+                    st.write(f"**Asignado a:** Líder Regional - *{p['assigned_ventas']}* (Asignación Directa)")
+                else:
+                    st.write(f"**Asignado a:** Agente de Ventas - *{p['assigned_ventas']}*")
                 
                 display_files_interface(p['id'], "step6_entrega", st.session_state.user_name, is_readonly)
                 
@@ -1567,19 +2286,10 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                         st.error("Debe marcar la casilla de confirmación de entrega.")
                                     else:
                                         # Guardar evidencia si existe
-                                        file_path = ""
                                         if uploaded_evidence_s6:
-                                            file_path = os.path.join(UPLOAD_DIR, f"{p['id']}_s6_{uploaded_evidence_s6.name}")
-                                            with open(file_path, "wb") as f:
-                                                f.write(uploaded_evidence_s6.getbuffer())
+                                            save_uploaded_file(uploaded_evidence_s6, p['id'], "step6_entrega")
                                                 
                                         conn = get_db_connection()
-                                        if file_path:
-                                            conn.execute('''
-                                                INSERT INTO uploads (project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                                VALUES (?, ?, ?, ?, ?, ?)
-                                            ''', (p['id'], "step6_entrega", uploaded_evidence_s6.name, file_path, st.session_state.user_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                                            
                                         conn.execute('''
                                             UPDATE projects 
                                             SET final_amount = ?, step6_completed = 1, current_stage = 7, lose_reason = ?
@@ -1587,6 +2297,7 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                                         ''', (final_val, comments_s6, p['id']))
                                         conn.commit()
                                         conn.close()
+                                        dispatch_step_completion_notifications(p['id'], 6)
                                         log_audit(p['id'], st.session_state.full_name, role, f"Completó entrega de cotización por monto final ${final_val:,.2f}")
                                         st.success("Datos de entrega guardados. Paso 7 habilitado para cierre de proyecto.")
                                         st.rerun()
@@ -1605,7 +2316,8 @@ if "✔️ Compuertas Técnicas" in tab_dict:
                 if p['step6_completed'] == 0:
                     st.warning("🔒 Este paso se encuentra bloqueado. Complete el Paso 6 para poder acceder.")
                 else:
-                    is_authorized_s7 = (role == "Admin/Director") and not is_readonly
+                    role_clean = str(role).strip().lower()
+                    is_authorized_s7 = (role_clean in ["admin/director", "director comercial", "director de proyectos", "director general"] or "director" in role_clean) and not is_readonly
                     
                     if p['status'] == "En Proceso":
                         if is_authorized_s7:
@@ -1645,15 +2357,26 @@ if "🗺️ Kanban Visual" in tab_dict:
         conn = get_db_connection()
         projects_k = conn.execute("SELECT * FROM projects").fetchall()
         conn.close()
+        projects_k = filter_user_projects([dict(r) for r in projects_k])
         
         col_kp, col_kg, col_kd = st.columns(3)
         
         # Helper: Renderizar tarjetas Kanban con archivos descargables integrados
         def render_kanban_card(p):
             with st.container(border=True):
+                prio = p.get('priority', 'Media')
+                if not prio:
+                    prio = 'Media'
+                color_prio_map = {"Alta": "red", "Media": "orange", "Baja": "green"}
+                color_badge = color_prio_map.get(prio, "orange")
+                
                 st.markdown(f"**{p['id']} - {p['name']}**")
+                st.markdown(f"⚠️ **Prioridad:** :{color_badge}[{prio}]")
                 st.write(f"💼 **Cliente:** {p['client']}")
                 st.write(f"💰 **Monto Cotizado:** ${p['total_amount']:,.2f}")
+                
+                ventas_team = p.get('assigned_ventas', 'Sin asignar')
+                st.write(f"👤 **Ventas:** {ventas_team}")
                 
                 # Paso actual descriptivo
                 steps_desc = {
@@ -1681,16 +2404,35 @@ if "🗺️ Kanban Visual" in tab_dict:
                 if files_proj:
                     st.markdown("**📂 Documentos Disponibles:**")
                     for f in files_proj:
-                        try:
-                            with open(f['file_path'], "rb") as file_bytes:
+                        # Global DB-driven fallback to local disk
+                        f_content = None
+                        if 'file_data' in dict(f) and f['file_data'] is not None:
+                            try:
+                                f_content = bytes(f['file_data'])
+                            except Exception:
+                                pass
+                        if f_content is None:
+                            try:
+                                with open(f['file_path'], "rb") as file_bytes:
+                                    f_content = file_bytes.read()
+                            except:
+                                pass
+                                
+                        if f_content is not None:
+                            col_k_dl, col_k_sv = st.columns(2)
+                            with col_k_dl:
                                 st.download_button(
-                                    label=f"📥 {f['filename']}",
-                                    data=file_bytes.read(),
+                                    label=f"📥 {f['filename']} (Web)",
+                                    data=f_content,
                                     file_name=f['filename'],
-                                    key=f"kanban_dl_{p['id']}_{f['id']}"
+                                    key=f"kanban_dl_{p['id']}_{f['id']}",
+                                    use_container_width=True
                                 )
-                        except:
-                            st.caption(f"⚠️ {f['filename']} (Error)")
+                            with col_k_sv:
+                                if st.button(f"💾 Guardar {f['filename']} en PC", key=f"kanban_sv_{p['id']}_{f['id']}", use_container_width=True):
+                                    save_file_directly_to_pc(f_content, f['filename'])
+                        else:
+                            st.caption(f"⚠️ {f['filename']} (No disponible)")
                 else:
                     st.caption("Sin documentos cargados.")
         
@@ -1833,12 +2575,45 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                             finally:
                                 conn.close()
                                 
-            # --- MANTENIMIENTO: RESTABLECIMIENTO TOTAL ---
-                        st.markdown("##### 💾 Copias de Seguridad y Respaldos")
-            with st.expander("💾 Copia de Seguridad y Respaldos"):
-                st.write("Genere un respaldo completo en formato JSON de toda la base de datos (proyectos, usuarios, historial y documentos) para guardarlo de forma segura en su computadora local. Podrá restaurar este archivo en cualquier momento en caso de pérdida o migración.")
+
+
+# ==========================================
+# MÓDULO ADICIONAL: CONSOLA DE CONTROL Y RESPALDOS (Solo Admin)
+# ==========================================
+if "⚙️ Consola de Control" in tab_dict:
+    with tab_dict["⚙️ Consola de Control"]:
+        st.subheader("⚙️ Consola de Control de DC Control")
+        st.write("Panel exclusivo para el Administrador para controlar respaldos, mantenimientos y canales de notificación global.")
+        
+        col_c_left, col_c_right = st.columns(2)
+        
+        with col_c_left:
+            st.markdown("##### 💾 Respaldo y Mantenimiento de Datos")
+            with st.container(border=True):
+                st.write("Genere respaldos estructurados para evitar saturar el almacenamiento de la nube. Puede descargar un respaldo plano (.json) o un archivo compilado (.zip) que contiene los documentos físicos, resúmenes y dossiers agrupados en carpetas por proyecto.")
                 
-                # Botón de Descarga
+                # --- Advanced ZIP Backup compilation ---
+                try:
+                    zip_data = generate_structured_zip_backup()
+                    col_z_dl, col_z_pc = st.columns(2)
+                    with col_z_dl:
+                        st.download_button(
+                            label="📥 Descargar ZIP Compilado (Web)",
+                            data=zip_data,
+                            file_name=f"respaldo_documental_dc_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                            key="btn_zip_dl"
+                        )
+                    with col_z_pc:
+                        if st.button("💾 Guardar ZIP Compilado en PC", use_container_width=True, key="btn_zip_save_pc"):
+                            save_file_directly_to_pc(zip_data, f"respaldo_documental_dc_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+                except Exception as e_zip:
+                    st.error(f"Error al compilar respaldo ZIP: {e_zip}")
+                    
+                st.markdown("---")
+                
+                # --- JSON backup download ---
                 try:
                     conn_bk = get_db_connection()
                     users_bk = [dict(row) for row in conn_bk.execute("SELECT * FROM users").fetchall()]
@@ -1847,6 +2622,14 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                     audit_bk = [dict(row) for row in conn_bk.execute("SELECT * FROM audit_log").fetchall()]
                     conn_bk.close()
                     
+                    # Safe Base64 encoding of binary data for JSON compatibility
+                    for row_u in uploads_bk:
+                        if row_u.get('file_data') is not None:
+                            try:
+                                row_u['file_data'] = base64.b64encode(bytes(row_u['file_data'])).decode('utf-8')
+                            except:
+                                row_u['file_data'] = None
+                                
                     bk_data = {
                         "backup_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "users": users_bk,
@@ -1854,27 +2637,32 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                         "uploads": uploads_bk,
                         "audit_log": audit_bk
                     }
-                    
                     bk_json = json.dumps(bk_data, ensure_ascii=False, indent=2)
-                    st.download_button(
-                        label="📥 Generar y Descargar Respaldo Completo (JSON)",
-                        data=bk_json,
-                        file_name=f"respaldo_dc_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        mime="application/json",
-                        use_container_width=True
-                    )
+                    
+                    col_bk_dl, col_bk_sv = st.columns(2)
+                    with col_bk_dl:
+                        st.download_button(
+                            label="📥 Generar Respaldo Plano (JSON - Web)",
+                            data=bk_json,
+                            file_name=f"respaldo_dc_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            use_container_width=True,
+                            key="btn_json_dl"
+                        )
+                    with col_bk_sv:
+                        if st.button("💾 Guardar Respaldo Plano en PC", use_container_width=True, key="btn_json_save_pc"):
+                            save_file_directly_to_pc(bk_json.encode('utf-8'), f"respaldo_dc_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
                 except Exception as e_bk:
-                    st.error(f"Error al generar respaldo para descarga: {e_bk}")
+                    st.error(f"Error al generar respaldo JSON: {e_bk}")
                     
                 st.markdown("---")
-                st.markdown("##### 📤 Restaurar Copia de Seguridad")
-                st.write("Suba un archivo de respaldo (.json) generado previamente para restaurar de forma masiva todos los registros (proyectos, usuarios, historial de auditoría y expediente de carga).")
-                st.warning("⚠️ IMPORTANTE: Al realizar la restauración, se limpiará por completo la base de datos actual antes de cargar los datos de respaldo. Esta acción no se puede deshacer.")
                 
-                uploaded_bk_file = st.file_uploader("Seleccione el archivo de respaldo (.json)", type=["json"], key="uploader_backup_rest")
+                # --- Database Restore ---
+                st.markdown("##### 📤 Restaurar Copia de Seguridad JSON")
+                uploaded_bk_file = st.file_uploader("Seleccione un archivo de respaldo (.json)", type=["json"], key="uploader_backup_rest_v36")
                 if uploaded_bk_file:
-                    confirm_rest = st.checkbox("Confirmo que deseo RESTAURAR la base de datos reemplazando toda la información actual.")
-                    if st.button("Proceder con la Restauración de Datos ⚡", type="primary", disabled=not confirm_rest, use_container_width=True):
+                    confirm_rest = st.checkbox("Confirmo que deseo RESTAURAR reemplazando toda la información actual de la base de datos.", key="chk_rest_confirm")
+                    if st.button("Proceder con la Restauración de Datos ⚡", type="primary", disabled=not confirm_rest, use_container_width=True, key="btn_execute_restore"):
                         try:
                             bk_content = uploaded_bk_file.read().decode("utf-8")
                             bk_parsed = json.loads(bk_content)
@@ -1885,62 +2673,60 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                             else:
                                 conn_rest = get_db_connection()
                                 cursor_rest = conn_rest.cursor()
-                                
-                                # Limpiar todo
                                 cursor_rest.execute("DROP TABLE IF EXISTS projects CASCADE")
                                 cursor_rest.execute("DROP TABLE IF EXISTS audit_log CASCADE")
                                 cursor_rest.execute("DROP TABLE IF EXISTS uploads CASCADE")
                                 cursor_rest.execute("DROP TABLE IF EXISTS users CASCADE")
+                                cursor_rest.execute("DROP TABLE IF EXISTS system_settings CASCADE")
                                 conn_rest.commit()
                                 conn_rest.close()
                                 
-                                # Re-inicializar tablas
                                 init_db(insert_demos=False)
                                 
                                 conn_ins = get_db_connection()
                                 cursor_ins = conn_ins.cursor()
                                 
-                                # Insertar usuarios
                                 for u in bk_parsed["users"]:
                                     cursor_ins.execute("""
                                         INSERT INTO users (username, password, full_name, role, email)
                                         VALUES (?, ?, ?, ?, ?)
                                     """, (u['username'], u['password'], u['full_name'], u['role'], u.get('email', '')))
                                     
-                                # Insertar proyectos
                                 for p_bk in bk_parsed["projects"]:
                                     cursor_ins.execute("""
                                         INSERT INTO projects (
                                             id, name, client, total_amount, final_amount, state, zone, 
-                                            assigned_lider, assigned_costos, assigned_ventas, status, current_stage, 
+                                            assigned_lider, assigned_costos, assigned_ventas, priority, status, current_stage, 
                                             lose_reason, lose_percentage_gap, created_at, target_date, 
                                             step1_completed, step2_ventas_done, step2_lider_done, step2_completed, 
                                             step3_completed, step4_completed, step5_completed, step6_completed
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     """, (
                                         p_bk['id'], p_bk['name'], p_bk['client'], p_bk.get('total_amount', 0.0), p_bk.get('final_amount', 0.0), p_bk['state'], p_bk['zone'],
-                                        p_bk['assigned_lider'], p_bk['assigned_costos'], p_bk['assigned_ventas'], p_bk['status'], p_bk['current_stage'],
+                                        p_bk['assigned_lider'], p_bk['assigned_costos'], p_bk['assigned_ventas'], p_bk.get('priority', 'Media'), p_bk['status'], p_bk['current_stage'],
                                         p_bk.get('lose_reason', ''), p_bk.get('lose_percentage_gap', 0.0), p_bk['created_at'], p_bk['target_date'],
                                         p_bk.get('step1_completed', 0), p_bk.get('step2_ventas_done', 0), p_bk.get('step2_lider_done', 0), p_bk.get('step2_completed', 0),
                                         p_bk.get('step3_completed', 0), p_bk.get('step4_completed', 0), p_bk.get('step5_completed', 0), p_bk.get('step6_completed', 0)
                                     ))
                                     
-                                # Insertar uploads
                                 for up in bk_parsed["uploads"]:
+                                    file_data_bytes = None
+                                    if up.get('file_data') is not None:
+                                        try:
+                                            file_data_bytes = base64.b64decode(up['file_data'])
+                                        except:
+                                            pass
                                     cursor_ins.execute("""
-                                        INSERT INTO uploads (id, project_id, step_name, filename, file_path, uploaded_by, uploaded_at)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                                    """, (up['id'], up['project_id'], up['step_name'], up['filename'], up['file_path'], up['uploaded_by'], up['uploaded_at']))
+                                        INSERT INTO uploads (id, project_id, step_name, filename, file_path, uploaded_by, uploaded_at, file_data)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (up['id'], up['project_id'], up['step_name'], up['filename'], up['file_path'], up['uploaded_by'], up['uploaded_at'], psycopg2.Binary(file_data_bytes) if file_data_bytes else None))
                                     
-                                # Insertar audit_log
                                 for log in bk_parsed["audit_log"]:
                                     cursor_ins.execute("""
                                         INSERT INTO audit_log (id, project_id, user_name, role, action, timestamp)
                                         VALUES (?, ?, ?, ?, ?, ?)
-                                    """, (log['id'], log['project_id'], log['user_name'], log['role'], log['action'], log['timestamp'])
-                                    )
+                                    """, (log['id'], log['project_id'], log['user_name'], log['role'], log['action'], log['timestamp']))
                                     
-                                # Sincronizar secuencias
                                 try:
                                     cursor_ins.execute("SELECT setval(pg_get_serial_sequence('uploads', 'id'), coalesce(max(id), 1))")
                                     cursor_ins.execute("SELECT setval(pg_get_serial_sequence('audit_log', 'id'), coalesce(max(id), 1))")
@@ -1949,42 +2735,109 @@ if "👥 Usuarios y Seguridad" in tab_dict:
                                     
                                 conn_ins.commit()
                                 conn_ins.close()
-                                
-                                st.success("🎉 ¡Copia de seguridad restaurada de forma exitosa en tu nube!")
+                                st.success("🎉 ¡Copia de seguridad restaurada de forma exitosa!")
                                 log_audit("SISTEMA", st.session_state.full_name, role, "Restauró base de datos desde un archivo de respaldo (.json)")
                                 st.rerun()
                         except Exception as e_rest:
                             st.error(f"❌ Error al restaurar respaldo: {e_rest}")
 
-
-            st.markdown("##### ⚙️ Mantenimiento de la Base de Datos")
-            with st.expander("🚨 Restablecer Base de Datos a Cero"):
-                st.warning("Esta acción borrará de manera definitiva todos los proyectos, archivos cargados en el disco, registros de auditoría y base de datos. Las cuentas de usuario y contraseñas permanecerán seguras.")
-                confirm_reset = st.checkbox("Entiendo los efectos y confirmo que deseo limpiar a cero toda la base de datos.")
+                st.markdown("---")
                 
-                if st.button("Restablecer Base de Datos ⚠️", type="primary", disabled=not confirm_reset):
+                # --- Database wipe / reset ---
+                st.markdown("##### 🚨 Restablecer Base de Datos a Cero")
+                st.warning("Esta acción borrará de manera definitiva todos los proyectos, archivos, bitácoras de auditoría y reportes en Supabase. Las cuentas de usuario y contraseñas permanecerán seguras.")
+                confirm_reset = st.checkbox("Entiendo los efectos y deseo limpiar a cero toda la base de datos.", key="chk_reset_confirm_v36")
+                if st.button("Restablecer Base de Datos a Cero ⚠️", type="primary", disabled=not confirm_reset, key="btn_execute_wipe"):
                     try:
                         conn_res = get_db_connection()
                         cursor_res = conn_res.cursor()
-                        cursor_res.execute("DROP TABLE IF EXISTS projects")
-                        cursor_res.execute("DROP TABLE IF EXISTS tasks")
-                        cursor_res.execute("DROP TABLE IF EXISTS audit_log")
-                        cursor_res.execute("DROP TABLE IF EXISTS uploads")
+                        cursor_res.execute("DROP TABLE IF EXISTS projects CASCADE")
+                        cursor_res.execute("DROP TABLE IF EXISTS audit_log CASCADE")
+                        cursor_res.execute("DROP TABLE IF EXISTS uploads CASCADE")
                         conn_res.commit()
                         conn_res.close()
                         
-                        # Limpiar archivos de uploads
                         if os.path.exists(UPLOAD_DIR):
                             shutil.rmtree(UPLOAD_DIR)
                             os.makedirs(UPLOAD_DIR)
                             
-                        # Recrear estructura vacía
                         init_db(insert_demos=False)
-                        
-                        st.success("¡Base de datos restablecida a cero de manera exitosa!")
+                        st.success("¡Base de datos de DC Control restablecida a cero de manera exitosa!")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Error al restablecer: {e}")
+                        st.error(f"Error al restablecer base de datos: {e}")
+
+        with col_c_right:
+            st.markdown("##### ✉️ Canales de Notificaciones y Alertas (SMTP & Teams)")
+            with st.container(border=True):
+                st.write("Configure las credenciales de correo de su empresa para despachar avisos automáticos a los involucrados cada vez que se complete un paso del flujo secuencial de cotizaciones.")
+                
+                # Read existing configs
+                notif_enabled = get_system_setting("notifications_enabled", "0")
+                curr_host = get_system_setting("smtp_host", "smtp.gmail.com")
+                curr_port = get_system_setting("smtp_port", "587")
+                curr_user = get_system_setting("smtp_user", "notificaciones@dccontrol.com")
+                curr_pass = get_system_setting("smtp_pass", "")
+                curr_sender = get_system_setting("smtp_sender", "DC Control Notificaciones")
+                curr_teams = get_system_setting("teams_webhook_url", "")
+                
+                enable_notif = st.checkbox("Habilitar Notificaciones de Sistema", value=(notif_enabled == "1"), key="cfg_notif_enabled")
+                edit_host = st.text_input("Servidor SMTP (Host)", value=curr_host, key="cfg_smtp_host")
+                edit_port = st.text_input("Puerto SMTP", value=curr_port, key="cfg_smtp_port")
+                edit_user = st.text_input("Correo Emisor (SMTP User)", value=curr_user, key="cfg_smtp_user")
+                edit_pass = st.text_input("Contraseña / Clave de Aplicación", value=curr_pass, type="password", key="cfg_smtp_pass")
+                edit_sender = st.text_input("Nombre de Remitente Visible", value=curr_sender, key="cfg_smtp_sender")
+                edit_teams = st.text_input("Microsoft Teams Webhook URL (Canal o Chat)", value=curr_teams, key="cfg_teams_webhook")
+                
+                col_cfg_save, col_cfg_test = st.columns(2)
+                with col_cfg_save:
+                    if st.button("Guardar Configuración 💾", use_container_width=True, type="primary", key="cfg_save_btn"):
+                        set_system_setting("notifications_enabled", "1" if enable_notif else "0")
+                        set_system_setting("smtp_host", edit_host)
+                        set_system_setting("smtp_port", edit_port)
+                        set_system_setting("smtp_user", edit_user)
+                        set_system_setting("smtp_pass", edit_pass)
+                        set_system_setting("smtp_sender", edit_sender)
+                        set_system_setting("teams_webhook_url", edit_teams)
+                        st.success("🎉 ¡Configuración guardada y sincronizada globalmente!")
+                        st.rerun()
+                with col_cfg_test:
+                    if st.button("Enviar Correo de Prueba ✉️", use_container_width=True, key="cfg_test_btn"):
+                        # Lookup admin's email
+                        conn = get_db_connection()
+                        admin_user = conn.execute("SELECT email FROM users WHERE username = 'noe.ortizadm'").fetchone()
+                        conn.close()
+                        admin_email = admin_user['email'] if admin_user else "director@dccontrol.com"
+                        
+                        try:
+                            msg = MIMEMultipart()
+                            msg['From'] = f"{edit_sender} <{edit_user}>"
+                            msg['To'] = admin_email
+                            msg['Subject'] = "🏗️ DC Control - Validación SMTP Exitosa"
+                            body_html = f"""<html>
+                            <body style="font-family: Arial, sans-serif; color: #333333;">
+                                <div style="background-color: #111827; color: white; padding: 15px 20px; border-radius: 6px 6px 0 0; border-left: 6px solid #00C875;">
+                                    <h2 style="margin: 0; font-size: 18px;">🏗️ Validación de Consola de Control - DC Control</h2>
+                                </div>
+                                <div style="padding: 20px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 6px 6px;">
+                                    <p>¡Hola <strong>Noe Ortiz</strong>!</p>
+                                    <p>Este es un correo de prueba enviado desde tu nueva <strong>Consola de Control de Escritorio</strong>.</p>
+                                    <p>La configuración del servidor SMTP y el envío global de notificaciones han sido validados con éxito. El sistema ya está listo para alertar a tu equipo técnico y comercial en tiempo real.</p>
+                                    <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 15px 0;">
+                                    <p style="font-size: 11px; color: #6b7280; text-align: center;">DC Control S.A. de C.V. • Trazabilidad y Gobernabilidad</p>
+                                </div>
+                            </body>
+                            </html>"""
+                            msg.attach(MIMEText(body_html, 'html'))
+                            
+                            server = smtplib.SMTP(edit_host, int(edit_port))
+                            server.starttls()
+                            server.login(edit_user, edit_pass)
+                            server.sendmail(edit_user, admin_email, msg.as_string())
+                            server.quit()
+                            st.success(f"📬 ¡Correo de prueba enviado con éxito a {admin_email}! Revisa tu bandeja de entrada.")
+                        except Exception as e_test_m:
+                            st.error(f"❌ Error al enviar correo de prueba: {e_test_m}")
 
 # ==========================================
 # MÓDULO 6: BITÁCORA DE AUDITORÍA (Solo Admin)
@@ -2010,6 +2863,29 @@ if "📜 Bitácora Auditoría" in tab_dict:
                 'timestamp': 'Fecha y Hora'
             })[['ID Proyecto', 'Usuario Responsable', 'Puesto / Rol', 'Acción Realizada', 'Fecha y Hora']]
             
+            # Obtener mapeo de IDs de proyecto a nombres para mostrar en el desplegable
+            conn_map = get_db_connection()
+            all_projs = conn_map.execute("SELECT id, name FROM projects").fetchall()
+            conn_map.close()
+            
+            p_id_to_name = {p['id']: f"{p['id']} - {p['name']}" for p in all_projs}
+            p_id_to_name['SISTEMA'] = 'SISTEMA'
+            p_id_to_name[''] = 'Sin ID'
+            
+            # Construir opciones únicas presentes en los logs
+            unique_ids = df_logs['project_id'].unique()
+            log_filter_options = ["Todos"] + sorted([p_id_to_name.get(pid, pid) for pid in unique_ids if pid])
+            
+            selected_log_filter = st.selectbox(
+                "🔍 Filtrar Bitácora por Obra / ID de Proyecto:",
+                log_filter_options,
+                key="bitacora_project_filter"
+            )
+            
+            if selected_log_filter != "Todos":
+                filter_id = selected_log_filter.split(" - ")[0]
+                df_logs_display = df_logs_display[df_logs_display['ID Proyecto'] == filter_id]
+                
             st.dataframe(df_logs_display, use_container_width=True, hide_index=True)
 
 # Footer Corporativo
